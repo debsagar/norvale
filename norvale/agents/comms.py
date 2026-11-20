@@ -6,11 +6,13 @@ import base64
 import email
 import imaplib
 import json
+import re
 import smtplib
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from datetime import datetime
 from email.message import EmailMessage
 from email.policy import default as default_policy
 from email.utils import format_datetime, make_msgid
@@ -84,10 +86,12 @@ class Comms:
     def find_subject(self, subject):
         return self.inbox(limit=0, subject=subject)
 
-    def read_mail(self, uid, *, body_limit=4000):
+    def read_mail(self, uid, *, body_limit=4000, delivery_metadata=False):
         with self._imap() as box:
-            self._checked_imap(box.select("INBOX"))
-            data = self._checked_imap(box.uid("fetch", str(uid), "(RFC822)"))  # marks it \\Seen, like opening it
+            select = box.select("INBOX", readonly=True) if delivery_metadata else box.select("INBOX")
+            self._checked_imap(select)
+            fetch = "(INTERNALDATE BODY.PEEK[])" if delivery_metadata else "(RFC822)"
+            data = self._checked_imap(box.uid("fetch", str(uid), fetch))
             if not data or not data[0]:
                 raise ValueError(f"no message with uid {uid}")
             msg = email.message_from_bytes(data[0][1], policy=default_policy)
@@ -99,9 +103,17 @@ class Comms:
                 attachments.append({"type": "calendar invitation", "ics": part.get_content()[:1500]})
             elif part.get_filename():
                 attachments.append({"type": part.get_content_type(), "name": part.get_filename()})
-        return {"uid": str(uid), "from": str(msg["From"]), "to": str(msg["To"]), "cc": str(msg["Cc"] or ""),
+        message = {"uid": str(uid), "from": str(msg["From"]), "to": str(msg["To"]), "cc": str(msg["Cc"] or ""),
                 "subject": str(msg["Subject"]), "date": str(msg["Date"]), "message_id": str(msg["Message-ID"]),
                 "body": body[:body_limit], "attachments": attachments, "content_type": msg.get_content_type()}
+        if delivery_metadata:
+            stamp = re.search(rb'\bINTERNALDATE "([^"]+)"', data[0][0], re.IGNORECASE)
+            if not stamp:
+                raise ValueError("Mail delivery timestamp is missing")
+            received = datetime.strptime(stamp[1].decode("ascii").strip(), "%d-%b-%Y %H:%M:%S %z")
+            paths = msg.get_all("Return-Path", [])
+            message.update(received_at=received.isoformat(), return_path=str(paths[0]) if len(paths) == 1 else None)
+        return message
 
     def raw_mailbox(self):
         """Controller export: every message in the inbox as raw RFC 822 bytes (not an agent tool)."""

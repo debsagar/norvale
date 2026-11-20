@@ -37,11 +37,12 @@ class Stack:
         with (self.env / "stack.log").open("a") as f:
             f.write(time.strftime("%H:%M:%S ") + msg + "\n")
 
-    def up(self, identities, load_time, frontend_port=None):
+    def up(self, identities, load_time, frontend_port=None, *, mail_identities=()):
         self.env.mkdir(parents=True, exist_ok=True)
         self.file.write_text(json.dumps(compose_mod.build(self.env, LIB, frontend_port), indent=1))
-        sec = accounts.make_secrets(self.env, identities)
-        accounts.write_mail_config(self.env, identities, sec)
+        mailboxes = [*identities, *mail_identities]
+        sec = accounts.make_secrets(self.env, mailboxes)
+        accounts.write_mail_config(self.env, mailboxes, sec)
         accounts.write_calendar_config(self.env, identities, sec)
         accounts.write_matrix_config(self.env, docker.IMAGES["matrix"])
         if not self.clock.file.exists():
