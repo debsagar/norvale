@@ -1,0 +1,5 @@
+<odoo>
+    <record id="group_analytics_reader" model="res.groups">
+        <field name="name">Norvale MES Analytics Reader</field>
+    </record>
+</odoo>

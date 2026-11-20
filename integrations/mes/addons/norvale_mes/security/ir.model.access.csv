@@ -1,0 +1,15 @@
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+analytics_production,Analytics manufacturing order,mrp.model_mrp_production,group_analytics_reader,1,0,0,0
+analytics_bom,Analytics BOM,mrp.model_mrp_bom,group_analytics_reader,1,0,0,0
+analytics_workorder,Analytics work order,mrp.model_mrp_workorder,group_analytics_reader,1,0,0,0
+analytics_workcenter,Analytics work center,mrp.model_mrp_workcenter,group_analytics_reader,1,0,0,0
+analytics_productivity,Analytics labor,mrp.model_mrp_workcenter_productivity,group_analytics_reader,1,0,0,0
+analytics_move,Analytics move,stock.model_stock_move,group_analytics_reader,1,0,0,0
+analytics_line,Analytics move line,stock.model_stock_move_line,group_analytics_reader,1,0,0,0
+analytics_lot,Analytics lot,stock.model_stock_lot,group_analytics_reader,1,0,0,0
+analytics_scrap,Analytics scrap,stock.model_stock_scrap,group_analytics_reader,1,0,0,0
+analytics_location,Analytics location,stock.model_stock_location,group_analytics_reader,1,0,0,0
+analytics_procurement,Analytics procurement group,stock.model_procurement_group,group_analytics_reader,1,0,0,0
+analytics_product,Analytics product,product.model_product_product,group_analytics_reader,1,0,0,0
+analytics_template,Analytics product template,product.model_product_template,group_analytics_reader,1,0,0,0
+analytics_unit,Analytics unit,uom.model_uom_uom,group_analytics_reader,1,0,0,0

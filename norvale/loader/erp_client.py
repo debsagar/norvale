@@ -14,12 +14,27 @@ class ErpError(Exception):
         self.status, self.exc_type, self.message = status, exc_type, message
 
 
+class SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+    @staticmethod
+    def origin(url):
+        parts = urllib.parse.urlsplit(url)
+        port = parts.port
+        if port is None:
+            port = {"http": 80, "https": 443}.get(parts.scheme)
+        return parts.scheme, parts.hostname, port
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if self.origin(req.full_url) != self.origin(newurl):
+            raise ErpError(code, "Redirect", "ERP refused a cross-origin redirect")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class ErpClient:
     def __init__(self, base, site, token=None):
         self.base, self.site, self.token = base, site, token
-        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self.opener = urllib.request.build_opener(SameOriginRedirect(), urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
 
-    def request(self, method, path, body=None, timeout=300):
+    def request(self, method, path, body=None, timeout=300, *, response_key=None):
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(self.base + path, data=data, method=method,
                                      headers={"Content-Type": "application/json", "Accept": "application/json",
@@ -31,6 +46,8 @@ class ErpClient:
                 payload = json.loads(r.read() or b"{}")
         except urllib.error.HTTPError as e:
             raise _error(e) from None
+        if response_key is not None:
+            return payload[response_key]
         return payload.get("data", payload.get("message"))
 
     def login(self, user, password):
@@ -47,6 +64,11 @@ class ErpClient:
         if order_by:
             params["order_by"] = order_by
         return self.request("GET", f"/api/resource/{q(doctype)}?" + urllib.parse.urlencode(params))
+
+    def metadata(self, doctype):
+        docs = self.request("POST", "/api/method/frappe.desk.form.load.getdoctype",
+                            {"doctype": doctype}, response_key="docs")
+        return next(doc for doc in docs if doc["name"] == doctype)
 
     def create(self, doctype, doc):
         return self.request("POST", f"/api/resource/{q(doctype)}", doc)

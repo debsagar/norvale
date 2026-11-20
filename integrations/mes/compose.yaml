@@ -1,0 +1,36 @@
+services:
+  db:
+    image: ${MES_POSTGRES_IMAGE:-postgres:16-alpine@sha256:1d5b02d3a9941fbd52437db4107f8c52d6297dac553ca1e5c299ebb3756b4857}
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: odoo
+      POSTGRES_PASSWORD: ${MES_DB_PASSWORD:?set MES_DB_PASSWORD}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    mem_limit: 512m
+    cpus: 0.75
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U odoo -d postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  odoo:
+    image: ${MES_ODOO_IMAGE:-odoo:18.0@sha256:d0b20aa4ec8a4d97ca096ada36275d77963d571c1cb1cceca69faf6098326c83}
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      HOST: db
+      USER: odoo
+      PASSWORD: ${MES_DB_PASSWORD:?set MES_DB_PASSWORD}
+    command: ["--db-filter=^norvale_mes$", "--database=norvale_mes", "--no-database-list", "--max-cron-threads=0"]
+    ports:
+      - "127.0.0.1:${MES_PORT:?set an unused MES_PORT}:8069"
+    volumes:
+      - odoo:/var/lib/odoo
+      - ./addons:/mnt/extra-addons:ro
+    mem_limit: 1g
+    cpus: 1.25
+volumes:
+  postgres:
+  odoo:

@@ -23,12 +23,13 @@ class Comms:
         self.user = ident["chat"]
 
     # ---------------- mail ----------------
-    def send_mail(self, to, subject, text, when, cc=None, in_reply_to=None, calendar=None, method="REQUEST"):
+    def send_mail(self, to, subject, text, when, cc=None, in_reply_to=None, calendar=None, method="REQUEST",
+                  *, message_id=None, on_status=None):
         m = EmailMessage()
         m["From"], m["To"], m["Subject"] = self.addr, ", ".join(to), subject
         if cc:
             m["Cc"] = ", ".join(cc)
-        m["Date"], m["Message-ID"] = format_datetime(when), make_msgid(domain=self.addr.split("@")[1])
+        m["Date"], m["Message-ID"] = format_datetime(when), message_id or make_msgid(domain=self.addr.split("@")[1])
         if in_reply_to:
             m["In-Reply-To"] = m["References"] = in_reply_to
         m.set_content(text)
@@ -37,7 +38,17 @@ class Comms:
                              params={"method": method})
         with smtplib.SMTP(self.eps["mail"]["host"], self.eps["mail"]["smtp"], timeout=30) as s:
             s.login(self.addr, self.sec["password"])
-            s.send_message(m)
+            if on_status:
+                on_status("uncertain")
+            try:
+                s.send_message(m)
+            except (smtplib.SMTPSenderRefused, smtplib.SMTPRecipientsRefused,
+                    smtplib.SMTPDataError, smtplib.SMTPNotSupportedError) as exc:
+                if on_status and (not isinstance(exc, smtplib.SMTPDataError) or 400 <= exc.smtp_code < 600):
+                    on_status("rejected")
+                raise
+            if on_status:
+                on_status("accepted")
         return m["Message-ID"]
 
     def _imap(self):
@@ -45,22 +56,30 @@ class Comms:
         box.login(self.addr, self.sec["password"])
         return box
 
+    @staticmethod
+    def _checked_imap(result):
+        status, data = result
+        if status != "OK":
+            raise imaplib.IMAP4.error(f"Mail readback failed ({status})")
+        return data
+
     def inbox(self, only_unseen=False, limit=15):
         with self._imap() as box:
-            box.select("INBOX", readonly=True)
-            _, ids = box.uid("search", None, "UNSEEN" if only_unseen else "ALL")
+            self._checked_imap(box.select("INBOX", readonly=True))
+            ids = self._checked_imap(box.uid("search", None, "UNSEEN" if only_unseen else "ALL"))
             out = []
             for uid in ids[0].split()[-limit:]:
-                _, data = box.uid("fetch", uid, "(FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)])")
+                data = self._checked_imap(box.uid(
+                    "fetch", uid, "(FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)])"))
                 hdr = email.message_from_bytes(data[0][1], policy=default_policy)
                 out.append({"uid": uid.decode(), "from": str(hdr["From"]), "to": str(hdr["To"]), "subject": str(hdr["Subject"]),
                             "date": str(hdr["Date"]), "seen": b"\\Seen" in data[0][0], "message_id": str(hdr["Message-ID"])})
             return out
 
-    def read_mail(self, uid):
+    def read_mail(self, uid, *, body_limit=4000):
         with self._imap() as box:
-            box.select("INBOX")
-            _, data = box.uid("fetch", str(uid), "(RFC822)")  # marks it \\Seen, like opening it
+            self._checked_imap(box.select("INBOX"))
+            data = self._checked_imap(box.uid("fetch", str(uid), "(RFC822)"))  # marks it \\Seen, like opening it
             if not data or not data[0]:
                 raise ValueError(f"no message with uid {uid}")
             msg = email.message_from_bytes(data[0][1], policy=default_policy)
@@ -74,7 +93,7 @@ class Comms:
                 attachments.append({"type": part.get_content_type(), "name": part.get_filename()})
         return {"uid": str(uid), "from": str(msg["From"]), "to": str(msg["To"]), "cc": str(msg["Cc"] or ""),
                 "subject": str(msg["Subject"]), "date": str(msg["Date"]), "message_id": str(msg["Message-ID"]),
-                "body": body[:4000], "attachments": attachments}
+                "body": body[:body_limit], "attachments": attachments, "content_type": msg.get_content_type()}
 
     def raw_mailbox(self):
         """Controller export: every message in the inbox as raw RFC 822 bytes (not an agent tool)."""

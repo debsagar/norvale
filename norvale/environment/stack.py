@@ -48,8 +48,9 @@ class Stack:
             self.clock.start_at(load_time)
         self.log(f"clock placed; simulated now {self.clock.now().isoformat()}")
         self.compose("up", "-d", "db", "redis-cache", "redis-queue", capture_output=True)
-        self._wait(lambda: docker.exec_(self.project, self.file, "db", "mariadb-admin", "-uroot", "-padmin", "ping",
-                                        check=False, capture_output=True).returncode == 0, "database")
+        self._wait(lambda: docker.exec_(self.project, self.file, "db", "sh", "-ec",
+                                        'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" exec mariadb --protocol=tcp -hdb -uroot -e "SELECT 1"',
+                                        check=False, capture_output=True).returncode == 0, "database bootstrap login")
         if not (self.env / "site-created").exists():
             self.log("creating fresh ERPNext site (several minutes)")
             r = self.compose("run", "--rm", "--no-deps", "backend", "bash", "-c", BENCH_SETUP,
@@ -67,7 +68,10 @@ class Stack:
 
     def endpoints(self):
         ip = lambda s: docker.container_ip(self.project, s)
-        eps = {"erp": f"http://{ip('backend')}:8000", "site": compose_mod.SITE,
+        ports = json.loads(self.file.read_text())["services"]["frontend"].get("ports", [])
+        erp = ("http://" + ports[0].rsplit(":", 1)[0] if ports
+               else f"http://{ip('backend')}:8000")
+        eps = {"erp": erp, "site": compose_mod.SITE,
                "mail": {"host": ip("mail"), "smtp": 25, "imap": 143},
                "calendar": f"http://{ip('calendar')}:5232", "chat": f"http://{ip('matrix')}:8008",
                "db": {"container_service": "db", "database": None}}

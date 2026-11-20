@@ -1,0 +1,31 @@
+{
+  "plm": {"url": "http://127.0.0.1:18442", "publisher": "norvale-publisher"},
+  "erp": {"base": "http://127.0.0.1:18443", "site": "revisions.localhost"},
+  "mes": {"url": "http://127.0.0.1:18441", "db": "norvale_mes", "login": "planner", "source_id": "example-mes"},
+  "example": {"workcenter_id": 1, "hold_location_id": 19},
+  "bridge": {
+    "source": "example-plm",
+    "checkpoint": "revisions.sqlite3",
+    "scoped_receipts": true,
+    "mapping": {
+      "NV-BRIDGE-SHAMPOO": {
+        "erp": {
+          "output": {"item": "NV-BRIDGE-SHAMPOO", "unit": "Nos", "qty": "1"},
+          "settings": {"company": "Revision Bridge Example"},
+          "components": {
+            "NV-BRIDGE-BULK": {"kind": "formulation", "source_unit": "g", "item": "NV-BRIDGE-BULK", "unit": "Kg", "factor": "0.001"},
+            "NV-BRIDGE-BOTTLE": {"kind": "packaging", "source_unit": "ea", "item": "NV-BRIDGE-BOTTLE", "unit": "Nos", "factor": "1"}
+          }
+        },
+        "mes": {
+          "output": {"item": 2, "unit": 1, "qty": "1"},
+          "settings": {"company_id": 1, "operation": {"name": "Fill", "workcenter_id": 1, "minutes": "1"}},
+          "components": {
+            "NV-BRIDGE-BULK": {"kind": "formulation", "source_unit": "g", "item": 1, "unit": 13, "factor": "0.001"},
+            "NV-BRIDGE-BOTTLE": {"kind": "packaging", "source_unit": "ea", "item": 3, "unit": 1, "factor": "1"}
+          }
+        }
+      }
+    }
+  }
+}

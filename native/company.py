@@ -1,17 +1,23 @@
 """Native Norvale engine. One durable event sequence for notebook and batch."""
 import sys, json, hashlib, time, os, random, math, fcntl
 from pathlib import Path
+from functools import cached_property
+from html import escape
+from email.message import EmailMessage
+from email.utils import parsedate_to_datetime
+from imaplib import IMAP4
+from smtplib import SMTPRecipientsRefused, SMTPResponseException, SMTPServerDisconnected
 from datetime import datetime, timedelta, timezone
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'walkthrough'))
 from norvale.environment.stack import Stack
 from norvale.environment import compose as compose_mod
 from norvale.loader.erp_client import ErpClient, ErpError
-from engine import EnterpriseSimV4, ROLES
+from walkthrough.engine import EnterpriseSimV4, ROLES
 
 RUN = Path(__file__).parent/'run'  # preserved fixed-scenario evidence
 ACTIVE_RUN = Path(__file__).parent/'recurring-run'
+ERP_ROLES = {'BUYER':['Purchase User'],'SCM_MGR':['Purchase User','Purchase Manager'],'SALES':['Sales User'],'WAREHOUSE':['Stock User'],'PLANNER':['Manufacturing User','Stock User'],'PRODUCTION':['Manufacturing User','Stock User'],'QA':['Quality Manager','Stock User'],'FINANCE':['Accounts User','Accounts Manager'],'MAINTENANCE':['Maintenance User'],'IT_ADMIN':['System Manager','Item Manager'],'CFO':['Accounts Manager','Purchase Manager']}
 
 def observable(value):
     if isinstance(value, dict):return {k:observable(v) for k,v in value.items() if k!='custom_norvale_operation'}
@@ -34,7 +40,8 @@ def provision(run=ACTIVE_RUN):
         return c
     compose_mod.build=build
     ids=[{'id':r['role_id'], 'mail':r['email'].replace('.example','.test'), 'chat':r['role_id'].lower()} for r in ROLES]
-    try:stack.up(ids, datetime(2027,1,1,tzinfo=timezone.utc))
+    port = int(os.environ["NORVALE_ERP_PORT"]) if os.environ.get("NORVALE_ERP_PORT") else None
+    try:stack.up(ids, datetime(2027,1,1,tzinfo=timezone.utc), frontend_port=port)
     finally:compose_mod.build=original
     return stack
 
@@ -42,27 +49,73 @@ def provision(run=ACTIVE_RUN):
 class Engine:
     company='Norvale Consumer Care BV'
     abbr='NCC'
-    def __init__(self, run=ACTIVE_RUN):
+    def __init__(self, run=ACTIVE_RUN, *, company_authority=None):
+        self.run = Path(run)
+        path = self.run/'config.json'
+        self.config = json.loads(path.read_text()) if path.exists() else None
+        if self.config:
+            self.validate_config(self.config)
+        checkpoint = self.run/'state.json'
+        if checkpoint.exists():
+            from native.company_world import check_binding
+            check_binding(self.config or {}, json.loads(checkpoint.read_text()))
+        self.additions = None
+        self.company_erp = self.make_company_erp(company_authority)
         self.run=Path(run); self.stack=Stack(self.run); self.stack.project=project(self.run)
-        self.eps=self.stack.endpoints(); self.admin=ErpClient(self.eps['erp'],self.eps['site']); self.admin.login('Administrator','admin')
-        token_path=self.run/'env/controller-token.json'
-        if token_path.exists():self.admin.token=json.loads(token_path.read_text())['token']
-        else:
-            secret=self.admin.call('frappe.core.doctype.user.user.generate_keys',{'user':'Administrator'})['api_secret']
-            self.admin.token=self.admin.get('User','Administrator')['api_key']+':'+secret
-            save(token_path,{'token':self.admin.token});token_path.chmod(0o600)
-        self.config=json.loads((self.run/'config.json').read_text()) if (self.run/'config.json').exists() else None
-        if self.config:self.validate_config(self.config)
+        self.eps=self.stack.endpoints()
         self.catalog=EnterpriseSimV4(seed=self.config['seed'] if self.config else 42, days=30, mode='dry-run')
         self.state=json.loads((self.run/'state.json').read_text()) if (self.run/'state.json').exists() else {'docs':{},'completed':[], 'physical':{}, 'decisions':{}, 'day':0}
         self.docs=self.state['docs']; self.api={}; self.event='setup'; self.day=self.state['day']
         self.wh={k:f'{v} - NCC' for k,v in [('rm','Raw Materials'),('fg','Finished Goods'),('wip','Work In Progress'),('hold','Quarantine')]}
-        self.roles={'BUYER':['Purchase User'],'SCM_MGR':['Purchase User','Purchase Manager'],'SALES':['Sales User'],'WAREHOUSE':['Stock User'],'PLANNER':['Manufacturing User','Stock User'],'PRODUCTION':['Manufacturing User','Stock User'],'QA':['Quality Manager','Stock User'],'FINANCE':['Accounts User','Accounts Manager'],'MAINTENANCE':['Maintenance User'],'IT_ADMIN':['System Manager','Item Manager'],'CFO':['Accounts Manager','Purchase Manager']}
+        self.roles={role:list(permissions) for role,permissions in ERP_ROLES.items()}
         secpath=self.run/'env/role-tokens.json'
         if secpath.exists():
             self.tokens=json.loads(secpath.read_text()); self.connect()
         else:self.tokens={}
         self.log('controller_started',source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+
+    @cached_property
+    def admin(self):
+        token_path = self.run / 'env/controller-token.json'
+        if token_path.exists():
+            token = json.loads(token_path.read_text())['token']
+            return ErpClient(self.eps['erp'], self.eps['site'], token)
+        client = ErpClient(self.eps['erp'], self.eps['site'])
+        client.login('Administrator', 'admin')
+        secret = client.call('frappe.core.doctype.user.user.generate_keys', {'user': 'Administrator'})['api_secret']
+        client.token = client.get('User', 'Administrator')['api_key'] + ':' + secret
+        save(token_path, {'token': client.token})
+        token_path.chmod(0o600)
+        return client
+
+    def make_company_erp(self, authority):
+        factory = (self.config or {}).get('company_authority')
+        checkpoint = self.run/'state.json'
+        if checkpoint.exists():
+            state = json.loads(checkpoint.read_text())
+            integrated = 'company_erp' in state
+            if integrated and not factory:
+                raise ValueError('Existing company lot integration requires company_authority')
+            if 'seed' in state['completed'] and factory and not integrated:
+                raise ValueError('Company lot integration requires a fresh recurring run')
+        if not factory:
+            if authority is not None:
+                raise ValueError('Enable company_authority in a fresh recurring configuration')
+            return None
+        if authority is None:
+            from importlib import import_module
+            module, name = factory.split(':', 1)
+            authority = getattr(import_module(module), name)(self.run)
+        from native.company_erp import CompanyERP
+        return CompanyERP(self, authority)
+
+    def recover_company_doc(self, key, doctype, role):
+        if key not in self.docs:
+            found = self.api[role].list(doctype, {'custom_norvale_operation': hashlib.sha256(key.encode()).hexdigest()})
+            if found:
+                self.docs[key] = {'doctype': doctype, 'name': found[0]['name']}
+                self.persist()
+        return self.get(key, role) if key in self.docs else None
 
     def connect(self):
         self.api={r:ErpClient(self.eps['erp'],self.eps['site'],t) for r,t in self.tokens.items()}
@@ -73,9 +126,12 @@ class Engine:
         with trace.open('a') as f:f.write(json.dumps({'event':self.event,'day':self.day,'kind':kind,**data},default=str)+'\n')
 
     def persist(self):
+        if (getattr(self, 'config', None) or {}).get('world') and 'world_binding' not in self.state:
+            from native.company_world import binding
+            self.state['world_binding'] = binding(self.config)
         self.state['day']=self.day;save(self.run/'state.json',self.state)
 
-    def write(self,key,dt,data,role=None,submit=False):
+    def write(self,key,dt,data,role=None,submit=False,*,before_submit=None):
         api=self.api[role] if role else self.admin
         mutated=False
         if key in self.docs:
@@ -86,7 +142,7 @@ class Engine:
                 existing=api.list(dt,{'custom_norvale_operation':hashlib.sha256(key.encode()).hexdigest()})
                 if existing:
                     self.docs[key]={'doctype':dt,'name':existing[0]['name']};self.persist()
-                    return self.write(key,dt,data,role,submit)
+                    return self.write(key,dt,data,role,submit,before_submit=before_submit)
                 data={**data,'custom_norvale_operation':hashlib.sha256(key.encode()).hexdigest()}
             self.log('request',role=role or 'setup administrator',method='POST',doctype=dt,body=data)
             try:doc=api.create(dt,data);mutated=True
@@ -94,6 +150,8 @@ class Engine:
             self.docs[key]={'doctype':dt,'name':doc['name']};self.persist()
             self.log('created',role=role,doc=doc)
         if submit and doc['docstatus']==0:
+            if before_submit:
+                before_submit(doc)
             self.log('request',role=role,method='PUT',doctype=dt,name=doc['name'],body={'docstatus':1})
             doc=api.update(dt,doc['name'],{'docstatus':1});mutated=True
         actual=api.get(dt,doc['name']) if mutated else doc
@@ -133,24 +191,42 @@ class Engine:
         self.admin.update('Stock Settings','Stock Settings',{'allow_negative_stock':0,'allow_to_make_quality_inspection_after_purchase_or_delivery':1})
         for c in self.catalog.accounts.values():self.write('customer:'+c['account_id'],'Customer',{'customer_name':c['name'],'customer_type':'Company','customer_group':'Commercial','territory':'All Territories','credit_limits':[{'company':self.company,'credit_limit':c['credit_limit_eur']}]})
         for k,v in self.catalog.vendors.items():self.write('vendor:'+k,'Supplier',{'supplier_name':v['name'],'supplier_group':'All Supplier Groups','supplier_type':'Company'})
+        lot_flow = getattr(self, 'company_erp', None)
+        batch_settings = {'has_batch_no': 1, 'create_new_batch': 0} if lot_flow else {}
+        if lot_flow:
+            from native.stock_precision import provision_stock_precision
+            provision_stock_precision(self.admin)
+            self.configure()
+            if not self.admin.list('Custom Field', {'dt': 'Work Order', 'fieldname': 'custom_norvale_definition'}):
+                self.admin.create('Custom Field', {
+                    'dt': 'Work Order', 'fieldname': 'custom_norvale_definition',
+                    'label': 'Approved PLM definition', 'fieldtype': 'Long Text', 'read_only': 1,
+                })
         for code,m in self.catalog.materials.items():
-            self.write('item:'+code,'Item',{'item_code':code,'item_name':m['name'],'item_group':'Raw Material','stock_uom':'Kg' if m['uom']=='KG' else 'Nos','is_stock_item':1,'valuation_rate':m['std_cost']})
+            self.write('item:'+code,'Item',{'item_code':code,'item_name':m['name'],'item_group':'Raw Material','stock_uom':'Kg' if m['uom']=='KG' else 'Nos','is_stock_item':1,'valuation_rate':m['std_cost'],**batch_settings})
         # Explicit water closes V4's otherwise implicit recipe mass balance.
-        self.write('item:WATER','Item',{'item_code':'WATER','item_name':'Process water','item_group':'Raw Material','stock_uom':'Kg','is_stock_item':1,'valuation_rate':0.001})
+        self.write('item:WATER','Item',{'item_code':'WATER','item_name':'Process water','item_group':'Raw Material','stock_uom':'Kg','is_stock_item':1,'valuation_rate':0.001,**batch_settings})
         for s in self.catalog.skus:
-            code=s['sku_id']; self.write('item:'+code,'Item',{'item_code':code,'item_name':s['name'],'item_group':'Products','stock_uom':'Nos','is_stock_item':1})
+            code=s['sku_id']; self.write('item:'+code,'Item',{'item_code':code,'item_name':s['name'],'item_group':'Products','stock_uom':'Nos','is_stock_item':1,**batch_settings})
             ingredients=[{'item_code':k,'qty':q/1000,'rate':self.catalog.materials[k]['std_cost']} for k,q in s['bom'].items()]
             mass=sum(q/1000 for k,q in s['bom'].items() if self.catalog.materials[k]['uom']=='KG')
             ingredients.append({'item_code':'WATER','qty':s['pack_size_kg']-mass,'rate':0.001})
             self.write('bom:'+code,'BOM',{'item':code,'quantity':1,'company':self.company,'currency':'EUR','items':ingredients},submit=True)
-        if 'opening' not in self.docs:
+        if lot_flow or 'opening' not in self.docs:
             items=[{'item_code':k,'qty':10000 if m['uom']=='KG' else 100000,'t_warehouse':self.wh['rm'],'basic_rate':m['std_cost']} for k,m in self.catalog.materials.items()]
             items.append({'item_code':'WATER','qty':100000,'t_warehouse':self.wh['rm'],'basic_rate':0.001})
             if self.config:
                 use=self.usage()
                 for row in items:row['qty']=max(1,math.ceil(use.get(row['item_code'],0)*self.config['opening_stock_days']))
                 items[-1]['qty']=100000  # process water is supplied by an unconstrained utility tank
-            self.write('opening','Stock Entry',{'stock_entry_type':'Material Receipt','company':self.company,'items':items},'WAREHOUSE',True)
+            doc = {'stock_entry_type':'Material Receipt','company':self.company,'items':items}
+            if lot_flow:
+                for row in items:
+                    row['t_warehouse'] = self.wh['hold']
+                actual = lot_flow.prepare_receipt('opening', 'Stock Entry', doc, 'WAREHOUSE')
+                lot_flow.receive(actual, 'opening', 'WAREHOUSE')
+            else:
+                self.write('opening','Stock Entry',doc,'WAREHOUSE',True)
         self.persist()
 
     def decision(self,key,role,evidence,question):
@@ -166,8 +242,8 @@ class Engine:
             payload={'model':model,'messages':[{'role':'user','content':json.dumps(prompt)}],'response_format':{'type':'json_object'},'max_tokens':1600}
             self.log('model_request',model=model,input=prompt)
             req=urllib.request.Request(base+'/chat/completions',json.dumps(payload).encode(),headers={'Authorization':'Bearer '+keyenv,'Content-Type':'application/json'})
-            from router import request_json
-            raw=request_json(req,lambda attempt:self.log('model_http_attempt',attempt=attempt))
+            from router import provider_json
+            raw=provider_json('Model',req,lambda attempt:self.log('model_http_attempt',attempt=attempt))
             self.log('model_response',response=raw)
             if raw['choices'][0].get('finish_reason')!='stop':raise RuntimeError('Incomplete model response; raw response retained for diagnosis')
             answer=json.loads(raw['choices'][0]['message']['content']);mode='model'
@@ -182,6 +258,11 @@ class Engine:
     def date(self):return (datetime(2027,1,1)+timedelta(days=self.day)).date().isoformat()
 
     def configure(self):
+        if getattr(self, 'company_erp', None):
+            evidence = dict(dt='Delivery Note', fieldname='custom_norvale_quality_releases')
+            if not self.admin.list('Custom Field', evidence):
+                self.admin.create('Custom Field', {**evidence, 'label':'Batch quality releases',
+                                  'fieldtype':'Long Text', 'no_copy':1, 'read_only':1})
         for dt in ['Stock Ledger Entry','Bin']:
             for role in ['Purchase User','Purchase Manager']:
                 if not self.admin.list('Custom DocPerm',{'parent':dt,'role':role,'read':1}):
@@ -203,19 +284,79 @@ class Engine:
         self.write('po-workflow','Workflow',{'workflow_name':'Norvale purchasing approval','document_type':'Purchase Order','is_active':1,'workflow_state_field':'workflow_state','states':[{'state':'Pending Approval','doc_status':'0','allow_edit':'Purchase User'},{'state':'Approved','doc_status':'1','allow_edit':'Purchase Manager'},{'state':'Rejected','doc_status':'0','allow_edit':'Purchase Manager'}],'transitions':[{'state':'Pending Approval','action':'Approve','next_state':'Approved','allowed':'Purchase Manager','allow_self_approval':0},{'state':'Pending Approval','action':'Reject','next_state':'Rejected','allowed':'Purchase Manager','allow_self_approval':0}]})
 
     def mail(self,key,sender,recipient,subject,body):
+        from native.company_erp import MailReadbackError
         from norvale.agents.comms import Comms
         roster={r['role_id']:r for r in ROLES};sec=json.loads((self.run/'env/secrets.json').read_text())
         def client(role):
             role={'BUYER':'BUYER_CHEM','SCM_MGR':'SC_MGR','WAREHOUSE':'WH_CLERK','MAINTENANCE':'MAINT_LEAD'}.get(role,role)
             r=roster[role];return Comms({'mail':r['email'].replace('.example','.test'),'chat':role.lower()},sec[role],self.eps)
-        marker='[Ref '+hashlib.sha256(key.encode()).hexdigest()[:16]+'] ';receiver=client(recipient)
-        found=[r for r in receiver.inbox(limit=200) if r['subject']==marker+subject]
-        if not found:
-            client(sender).send_mail([receiver.addr],marker+subject,body,datetime.fromisoformat(self.date()).replace(tzinfo=timezone.utc))
+        reference = hashlib.sha256(key.encode()).hexdigest()
+        marker = f'[Ref {reference[:16]}] '
+        origin, receiver = client(sender), client(recipient)
+        message_id = f'<norvale-{reference}@{origin.addr.split("@")[1]}>'
+        ledger = self.state.setdefault('mail_operations', {})
+        sent_day = ledger.get(key, {}).get('sent_day', self.date())
+        sent_at = datetime.fromisoformat(sent_day).replace(tzinfo=timezone.utc)
+        expected = EmailMessage()
+        expected.set_content(body)
+        intent = {'from': origin.addr, 'to': receiver.addr, 'subject': marker + subject,
+                  'body': expected.get_content()}
+        fingerprint = hashlib.sha256(json.dumps(intent, sort_keys=True).encode()).hexdigest()
+
+        def record(status, confirmed_id=None):
+            if status == 'rejected':
+                del ledger[key]
+            else:
+                ledger[key] = {'status': status, 'fingerprint': fingerprint,
+                               'message_id': confirmed_id or message_id, 'sent_day': sent_day}
+            self.persist()
+
+        if key in ledger and ledger[key]['fingerprint'] != fingerprint:
+            raise MailReadbackError('Mail operation intent changed on retry')
+
+        def delivered():
+            known_id = ledger.get(key, {}).get('message_id', message_id)
+            candidates = [row for row in receiver.inbox(limit=sys.maxsize)
+                          if row['subject'].startswith(marker) or row['message_id'] == known_id]
+            if not candidates:
+                return False
+            if len(candidates) != 1:
+                raise MailReadbackError('Duplicate mail operation reference')
+            message = receiver.read_mail(candidates[0]['uid'], body_limit=None)
+            actual = {k: message[k] for k in intent}
+            actual['body'] = actual['body'].replace('\r\n', '\n').replace('\r', '\n')
+            expected_id = ledger.get(key, candidates[0])['message_id']
+            try:
+                delivered_at = parsedate_to_datetime(message.get('date') or '')
+            except (TypeError, ValueError, OverflowError):
+                delivered_at = None
+            if (delivered_at != sent_at or actual != intent or message['cc'] or message['attachments']
+                    or message['content_type'] != 'text/plain'
+                    or message['message_id'] != expected_id
+                    or message['message_id'] != candidates[0]['message_id']):
+                raise MailReadbackError('Mail delivery readback differs from intended message')
+            record('confirmed', message['message_id'])
+            self.log('native_mail_readback',sender=sender,recipient=recipient,message=message)
+            return True
+
+        if delivered():
+            return
+        error = None
+        if key not in ledger:
+            try:
+                origin.send_mail([receiver.addr], intent['subject'], body,
+                                 sent_at,
+                                 message_id=message_id, on_status=record)
+            except OSError as exc:
+                if key not in ledger:
+                    raise
+                error = exc
+        try:
             self.stack.settle()
-            found=[r for r in receiver.inbox(limit=200) if r['subject']==marker+subject]
-        if len(found)!=1:raise RuntimeError('Mail delivery/duplicate check failed')
-        self.log('native_mail_readback',sender=sender,recipient=recipient,message=receiver.read_mail(found[0]['uid']))
+        except TimeoutError as exc:
+            error = exc
+        if not delivered():
+            raise TimeoutError(f'Mail delivery pending ({ledger[key]["status"]}) for {key}') from error
 
     def purchase(self):
         po=self.write('po','Purchase Order',{'company':self.company,'supplier':self.get('vendor:BRENNER')['name'],'schedule_date':'2027-01-04','items':[{'item_code':'SLES','qty':500,'rate':1.42,'schedule_date':'2027-01-04','warehouse':self.wh['hold']}]},'BUYER')
@@ -368,8 +509,28 @@ class Engine:
     def dated(self,day):return (datetime(2027,1,1)+timedelta(days=day)).date().isoformat()
 
     def observe(self,role,dt,filters,fields):
+        as_of = self.date()
+        date_field = {
+            'GL Entry': 'posting_date', 'Stock Ledger Entry': 'posting_date',
+            'Purchase Receipt': 'posting_date', 'Sales Order': 'transaction_date',
+            'Purchase Order': 'transaction_date',
+        }.get(dt)
+        if date_field:
+            cutoff = ['<=', as_of]
+            if isinstance(filters, dict):
+                bound = filters.get(date_field)
+                if date_field not in filters:
+                    filters = {**filters, date_field: cutoff}
+                elif isinstance(bound, (list, tuple)) and bound[0] == '<=':
+                    filters = {**filters, date_field: ['<=', min(as_of, bound[1])]}
+                else:
+                    filters = [[field, *value] if isinstance(value, (list, tuple))
+                               else [field, '=', value] for field, value in filters.items()]
+                    filters.append([date_field, *cutoff])
+            else:
+                filters = [*(filters or ()), [date_field, *cutoff]]
         rows=self.api[role].list(dt,filters,fields,limit=10000)
-        self.log('observation',role=role,doctype=dt,as_of=self.date(),rows=rows)
+        self.log('observation',role=role,doctype=dt,as_of=as_of,rows=rows)
         return rows
 
     def inventory(self,role):
@@ -399,23 +560,28 @@ class Engine:
 
     def choose(self,key,role,evidence,question,action='approve',model=False):
         if key in self.state['decisions']:return self.state['decisions'][key]['output']
+        if (getattr(self, 'config', None) or {}).get('company_operating') and os.environ.get('NORVALE_OFFLINE') == '1':
+            from integrations.company_run.operating import offline_decision
+            return offline_decision(self, key, role, evidence, question)
         from router import route
         policies=self.effective_policies(role)
-        history=[d for d in self.state['decisions'].values() if d['input']['role']==role]
+        history=[d for d in self.state['decisions'].values() if d['input']['role']==role and d['mode']!='provider-unavailable']
         def relevant(d):
             previous=d['input'].get('evidence',{});previous=previous.get('observations',previous)
             return evidence.get('supplier') is not None and previous.get('supplier')==evidence['supplier']
         cases=[{'as_of':d['input']['as_of'],'mode':d['mode'],'output':{'action':d['output']['action'],'reason':d['output'].get('reason','')[:240]}} for d in history if relevant(d)][-6:]
         matches=[p for p in policies if role=='SCM_MGR' and type(evidence.get('grand_total')) in (int,float) and 0<=evidence['grand_total']<=p['approval_limit'] and evidence.get('supplier') in p['suppliers'] and evidence.get('items') and all(r.get('item_code') in p['items'] and r.get('qty',0)>0 and r.get('rate',-1)>=0 for r in evidence['items'])]
         policy=matches[-1] if matches else None
+        def comparable_evidence(value):
+            normalized = dict(value)
+            for field in ('supplier_receipts', 'other_open_orders', 'coverage'):
+                if field in normalized:
+                    normalized[field] = sorted(normalized[field], key=lambda row: json.dumps(row, sort_keys=True))
+            return normalized
+
+        current = comparable_evidence(evidence)
         def comparable(d):
-            previous=d['input'].get('evidence',{})
-            before={r['item_code']:r for r in previous.get('items',[])}
-            now={r['item_code']:r for r in evidence.get('items',[])}
-            def coverage_state(value):
-                target=policy['reorder_target']
-                return sorted((r['item_code'],target>0 and r.get('released_raw_materials_qty',0)>target,r.get('open_po_qty_excluding_this',0)>0,r.get('quarantine_qty',0)>0) for r in value.get('coverage',[]))
-            return coverage_state(previous)==coverage_state(evidence) and bool(now) and now.keys()==before.keys() and all(abs(r['rate']-before[k]['rate'])<=max(.001,abs(before[k]['rate'])*.1) and abs(r['qty']-before[k]['qty'])<=max(1,before[k]['qty']*.25) for k,r in now.items())
+            return comparable_evidence(d['input'].get('evidence', {})) == current
         cached=policy and any(d.get('policy')==policy and d.get('classification') is False and comparable(d) for d in history)
         route_evidence={**evidence,'policy_check':{'applicable_policy':False,'authorization':'No matching effective policy; classify this as a new judgment case unless an explicit authorized procedure is supplied.'}}
         route_cases=cases
@@ -434,7 +600,14 @@ class Engine:
         return result['output']
 
     def observed_usage(self):
-        rows=self.observe('BUYER','Stock Ledger Entry',{'posting_date':['<=',self.date()],'actual_qty':['<',0],'warehouse':self.wh['rm']},['item_code','actual_qty','posting_date'])
+        filters = {'posting_date':['<=',self.date()],'actual_qty':['<',0],'warehouse':self.wh['rm']}
+        lot_flow = getattr(self, 'company_erp', None)
+        if lot_flow:
+            # A quarantine transfer is containment, not material use.
+            filters['voucher_type'] = 'Stock Entry'
+            filters['voucher_no'] = ['in', [p['target_id'] for p in lot_flow.state['completions'].values()
+                                            if p.get('target_id')] or ['']]
+        rows=self.observe('BUYER','Stock Ledger Entry',filters,['item_code','actual_qty','posting_date'])
         use={}
         for row in rows:use[row['item_code']]=use.get(row['item_code'],0)-float(row['actual_qty'])/max(1,self.day+1)
         forecast_key='forecast:'+str(self.day)
@@ -448,6 +621,13 @@ class Engine:
             doc=self.api['PLANNER'].get('Sales Order',order['name'])
             for row in doc['items']:
                 remaining=max(0,float(row['qty'])-float(row.get('delivered_qty',0)))
+                if lot_flow:
+                    planned = lot_flow.attempt('forecast-definition:' + row['item_code'], 'PLANNER',
+                                               lambda: lot_flow.forecast_components(row['item_code']))
+                    if planned is not None:
+                        for code, per in planned.items():
+                            forecast[code] = forecast.get(code, 0) + remaining * per / 7
+                        continue
                 boms=self.observe('PLANNER','BOM',{'item':row['item_code'],'is_active':1,'is_default':1,'docstatus':1},['name'])
                 for bom in boms:
                     recipe=self.api['PLANNER'].get('BOM',bom['name']);self.log('forecast_evidence',role='PLANNER',order=doc,bom=recipe)
@@ -468,6 +648,27 @@ class Engine:
         self.write('mandate:2027','Note',{'title':'Operating mandates effective 2027-01-01','public':1,'content':json.dumps({'effective_date':'2027-01-01','review_date':'2027-05-01','SCM_MGR':'Approve or reject supplier purchases and item reorder changes using observed evidence; issue scoped purchasing policies.','CFO':'Review finances and revise purchasing policies; no configured spending ceiling.','BUYER':'Observe materials, request purchases; cannot approve own purchase or book stock.','IT_ADMIN':'Implement separately approved item changes after approval date.','PRODUCTION':'Execute authorized operations within available stock and shift capacity.'})})
         self.state.setdefault('ops',{'orders':{},'purchases':{},'production':{},'invoices':{},'maintenance':{},'changes':{},'meter':0,'serviced_meter':0,'shortage_days':{}})
         self.persist()
+        self.seed_opening_orders()
+
+    def seed_opening_orders(self):
+        for index, order in enumerate(self.config.get('opening_orders', []), 1):
+            key = f'opening-order-{index}'
+            sku = next(s for s in self.catalog.skus if s['sku_id'] == order['item'])
+            customer = self.get('customer:' + order['customer'])['name']
+            due = self.dated(order['due_day'])
+            line = dict(item_code=order['item'], qty=order['quantity'], rate=sku['unit_price'],
+                        delivery_date=due, warehouse=self.wh['fg'])
+            doc = self.write(key, 'Sales Order', dict(company=self.company, customer=customer,
+                             transaction_date=self.date(), delivery_date=due, items=[line]), 'SALES', True)
+            row, = doc['items']
+            if (doc['docstatus'] != 1 or doc['customer'] != customer or doc['company'] != self.company
+                    or row['warehouse'] != line['warehouse'] or float(row.get('delivered_qty') or 0) != 0
+                    or row['item_code'] != line['item_code']
+                    or row['qty'] != line['qty'] or row['delivery_date'] != due or row['rate'] != line['rate']):
+                raise ValueError('Opening Sales Order readback differs from scenario')
+            self.state['ops']['orders'][key] = dict(key=key, item=order['item'], qty=line['qty'],
+                                                    rate=line['rate'], customer=order['customer'], day=self.day)
+            self.persist()
 
     def regime(self):
         from regimes import factors
@@ -486,25 +687,186 @@ class Engine:
             self.write(p['key'],'Sales Order',{'company':self.company,'customer':self.get('customer:'+p['customer'])['name'],'delivery_date':self.dated(self.day+7),'items':[{'item_code':p['item'],'qty':p['qty'],'rate':p['rate'],'delivery_date':self.dated(self.day+7),'warehouse':self.wh['fg']}]},'SALES',True)
             self.state['ops']['orders'].setdefault(p['key'],p);self.persist()
 
+    def admit_production_order(self, system, event_id, cfg, payload, ordered, delivery):
+        from native.company_erp import Pending
+
+        key = 'addon-order:' + hashlib.sha256(json.dumps([system, event_id]).encode()).hexdigest()
+        line = {'item_code': cfg['item'], 'qty': payload['quantity'], 'rate': payload['rate'],
+                'warehouse': self.wh['fg'], 'delivery_date': delivery}
+        data = {'company': self.company, 'customer': cfg['customer'], 'po_no': payload['case'],
+                'transaction_date': ordered, 'delivery_date': delivery, 'ignore_pricing_rule': 1,
+                'items': [line]}
+
+        def verify(doc):
+            rows = doc.get('items', [])
+            if (any(doc.get(k) != data[k] for k in
+                    ('company', 'customer', 'po_no', 'transaction_date', 'delivery_date'))
+                    or len(rows) != 1 or any(rows[0].get(k) != v for k, v in line.items())
+                    or rows[0].get('conversion_factor') != 1 or not rows[0].get('name')):
+                raise Pending('Production Sales Order readback differs from approved request')
+
+        doc = self.write(key, 'Sales Order', data, 'SALES', True, before_submit=verify)
+        verify(doc)
+        if doc.get('docstatus') != 1:
+            raise Pending('Production Sales Order has not been submitted')
+        order_day = (datetime.fromisoformat(ordered) - datetime(2027, 1, 1)).days
+        order = {'key': key, 'item': cfg['item'], 'qty': payload['quantity'], 'rate': payload['rate'],
+                 'customer': cfg['customer'], 'day': order_day, 'production_profile': system}
+        if self.state['ops']['orders'].setdefault(key, order) != order:
+            raise Pending('Production order conflicts with the existing queue entry')
+        self.persist()
+
+    @staticmethod
+    def purchase_unavailable(po):
+        return (po['docstatus'] == 2 or po.get('workflow_state') == 'Rejected'
+                or po.get('status') in ('Closed', 'Cancelled', 'Completed', 'On Hold'))
+
+    @staticmethod
+    def purchase_date(po, row):
+        return row.get('expected_delivery_date') or row.get('schedule_date') or po.get('schedule_date')
+
+    @staticmethod
+    def purchase_balance(row):
+        return max(0, row['qty'] - (row.get('received_qty') or 0))
+
+    @classmethod
+    def inbound_by_item(cls, purchase_orders):
+        """Open stock-unit balances and dated commitments visible to the buyer."""
+        inbound = {}
+        for po in purchase_orders:
+            if cls.purchase_unavailable(po):
+                continue
+            for row in po['items']:
+                expected = cls.purchase_date(po, row)
+                if expected:
+                    balance = cls.purchase_balance(row) * (row.get('conversion_factor') or 1)
+                    inbound.setdefault(row['item_code'], []).append((expected, balance))
+        return inbound
+
+    def review_supplier_delays(self, orders, stock, use, active):
+        today = self.date()
+        confirmed = self.inbound_by_item(po for po in orders.values() if po['docstatus'] == 1)
+        for name, po in orders.items():
+            lines = {row['name']: row for row in po['items']}
+            pending = active.get(name, {})
+            for line in sorted(lines.keys() | pending.keys()):
+                row = lines.get(line)
+                case = pending.get(line)
+                if not case and (po['docstatus'] != 1 or self.purchase_unavailable(po)):
+                    continue
+                date = self.purchase_date(po, row) if row else None
+                balance = self.purchase_balance(row) if row else 0
+                item = row['item_code'] if row else case['item']
+                available = stock.get((item, self.wh['rm']), 0)
+                # Stock needed before another order can arrive. Same-day PO dates still
+                # count as scheduled supply. Overdue dates do not cover this review.
+                vendor = self.catalog.source_list.get(item)
+                lead = self.catalog.vendors[vendor]['supplies'][item][1][0] if vendor else 1
+                horizon = self.dated(self.day + lead)
+                timely = sum(qty for eta, qty in confirmed.get(item, []) if today <= eta <= horizon)
+                needed = use.get(item, 0) * lead
+                if po.get('workflow_state') == 'Rejected':
+                    reason = 'Purchase order rejected. Reassess demand through normal purchasing.'
+                elif po['docstatus'] == 1 and row and not balance:
+                    reason = 'Native PO balance is fully received. Check released coverage through normal planning.'
+                elif po['docstatus'] != 1 or self.purchase_unavailable(po):
+                    reason = f"Purchase order is {po.get('status') or 'no longer submitted'}. Reassess coverage."
+                elif not row:
+                    reason = 'Purchase order line removed. Reassess coverage.'
+                elif not date or date >= today:
+                    reason = 'Native delivery schedule no longer overdue. Reassess coverage against the observed date.'
+                elif available + timely >= needed:
+                    reason = 'Released stock and dated inbound cover current lead-time demand.'
+                else:
+                    reason = None
+
+                if not case and reason:
+                    continue
+                date_label = 'Expected Delivery Date' if row and row.get('expected_delivery_date') else 'Required By'
+                observation = (f"As of {today}, PO {escape(name)}, line {escape(line)}, material {escape(item)}. "
+                               f"Native {date_label} {date or 'unavailable'}. Open balance {balance:g} "
+                               f"{escape((row or {}).get('uom') or 'order units')}. "
+                               f"Released stock {available:g}, timely inbound {timely:g}, "
+                               f"lead-time demand {needed:g} (stock units).")
+                snapshot = [date, balance]
+                if case and not reason and case['snapshot'] == snapshot and case['review'] and case['review'] > today:
+                    continue
+                review = case['review'] if reason and case['review'] else self.dated(self.day + 1)
+                if case and snapshot != case['snapshot']:
+                    prior_date, prior_balance = case['snapshot']
+                    observation += (f" Previous native delivery date {prior_date or 'unavailable'}, "
+                                    f"open balance {prior_balance:g} order units.")
+                if reason:
+                    description = observation + ' ' + reason
+                else:
+                    description = (observation + f' Buyer to check supplier status and review coverage by {review}. '
+                                   'Route any substitution or expedite spend to SCM for separate approval.')
+                fields = dict(reference_type='Purchase Order', reference_name=name,
+                              assigned_by='scm_mgr@norvale.test', allocated_to='buyer@norvale.test',
+                              date=review, status='Closed' if reason else 'Open', description=description)
+                if not case:
+                    base = f'supplier-delay:{name}:{line}:{today}'
+                    key = base
+                    episode = 1
+                    while key in self.docs:
+                        episode += 1
+                        key = f'{base}:{episode}'
+                    case = dict(key=key, item=item, snapshot=snapshot, review=None)
+                    active.setdefault(name, pending)[line] = case
+                    self.persist()
+                # Persist the episode before the POST. If supplier evidence changes
+                # after a lost reply, recover the same task and reconcile its fields.
+                task = self.write(case['key'], 'ToDo', fields, 'SCM_MGR')
+                if any(task.get(k) != v for k, v in fields.items()):
+                    self.api['SCM_MGR'].update('ToDo', task['name'], fields)
+                task = self.api['BUYER'].get('ToDo', task['name'])
+                if any(task.get(k) != v for k, v in fields.items()):
+                    raise ValueError('Supplier delay task differs from buyer readback')
+                self.log('supplier_delay_review', role='BUYER', as_of=today, doc=task)
+                if reason:
+                    del pending[line]
+                    if not pending:
+                        del active[name]
+                else:
+                    case.update(snapshot=snapshot, review=review)
+                self.persist()
+
     def replenishment(self):
         ops=self.state['ops']
+        active = ops.setdefault('supplier_delays', {})
+        stock = self.inventory('BUYER')
+        use = self.observed_usage()
+        submitted = self.observe('BUYER', 'Purchase Order', {
+            'company': self.company, 'docstatus': 1,
+            'status': ['not in', ['Closed', 'Cancelled', 'Completed', 'On Hold']],
+        }, ['name'])
+        # Active reviews also need terminal orders, which disappear from the open list.
+        orders = {name: self.api['BUYER'].get('Purchase Order', name)
+                  for name in sorted({row['name'] for row in submitted}
+                                     | {name for name, cases in active.items() if cases})}
+        self.review_supplier_delays(orders, stock, use, active)
+
         def build():
-            stock=self.inventory('BUYER');use=self.observed_usage();items=self.observe('BUYER','Item',{'item_code':['in',list(use)]},['name','item_code'])
-            on_order={k:0 for k in use}
-            for key,p in ops['purchases'].items():
-                if p.get('received'):continue
-                po=self.get(key,'BUYER')
-                if not p.get('received') and po.get('workflow_state')!='Rejected':
-                    for row in p['items']:on_order[row['item_code']]+=row['qty']
+            tracked = [self.get(key, 'BUYER') for key, p in ops['purchases'].items() if not p.get('received')]
+            tracked_names = {d['name'] for d in tracked}
+            inbound = self.inbound_by_item(tracked + [po for name, po in orders.items()
+                                                    if name not in tracked_names])
             groups={}
             for code,daily in use.items():
                 if daily<=0 or code=='WATER':continue
+                if code not in self.catalog.source_list:
+                    self.log('blocked', role='BUYER', item=code, reason='No recurring supplier policy')
+                    continue
                 vendor=self.catalog.source_list[code];cost,(lead,sd),_=self.catalog.vendors[vendor]['supplies'][code]
                 master=self.api['BUYER'].get('Item',code)
                 configured=next((r['warehouse_reorder_level'] for r in master.get('reorder_levels',[]) if r['warehouse']==self.wh['rm']),0)
                 targets=[p['reorder_target'] for p in self.effective_policies('SCM_MGR') if code in p['items']]
                 threshold=max([daily*(lead+self.catalog.safety_days[code]),configured]+targets)
-                current=stock.get((code,self.wh['rm']),0)+on_order[code]
+                coverage_end = self.dated(self.day + math.ceil(lead + self.catalog.safety_days[code]))
+                # Overdue open commitments still need receipt or buyer resolution. Counting
+                # them avoids issuing a duplicate order solely because a promised date passed.
+                on_order = sum(q for promised, q in inbound.get(code, []) if promised <= coverage_end)
+                current=stock.get((code,self.wh['rm']),0)+on_order
                 if current<threshold:
                     qty=max(12,math.ceil(max(daily*8,threshold-current)/12)*12)
                     groups.setdefault(vendor,[]).append({'item_code':code,'qty':qty,'rate':round(cost*self.regime()['cost'],4),'schedule_date':self.dated(self.day+lead),'warehouse':self.wh['hold']})
@@ -517,18 +879,55 @@ class Engine:
             ops['purchases'].setdefault(p['key'],p);self.persist()
             self.mail(p['key'],'BUYER','SCM_MGR','Replenishment approval requested',f"Native purchase {self.get(p['key'])['name']} replenishes released inventory below lead-time plus safety coverage.")
 
+    def schedule_supplier_arrival(self, key, purchase, submitted):
+        from native.company_erp import Pending
+        if 'arrival_due' in purchase or purchase.get('world_dispatched'):
+            return
+        if submitted.get('docstatus') != 1:
+            raise Pending('Supplier dispatch requires a submitted purchase order')
+        dates = [row.get('schedule_date') or submitted.get('schedule_date') for row in submitted['items']]
+        if not dates or not all(dates):
+            raise Pending('Submitted purchase order lacks a promised delivery date')
+        promised = (datetime.fromisoformat(max(dates)).date() -
+                    datetime.fromisoformat(self.dated(0)).date()).days
+        if self.config.get('world'):
+            from native.company_world import dispatch
+            dispatch(self, key, submitted, promised)
+            purchase.update(world_dispatched=True, approved_day=self.day)
+            return
+        rng = random.Random(self.config['seed'] + int(hashlib.sha256(key.encode()).hexdigest()[:8], 16))
+        delay = math.ceil((self.regime()['supply'] - 1) * max(1, promised - purchase['day']))
+        purchase['arrival_due'] = max(self.day + 1, promised + delay + rng.choice([-1, 0, 0, 2]))
+        purchase['approved_day'] = self.day
+
+    def purchase_decision(self, key, role, evidence, question, **options):
+        from router import ProviderUnavailable
+        try:
+            return self.choose(key, role, evidence, question, **options)
+        except ProviderUnavailable as exc:
+            if not self.config.get('company_operating'):
+                raise
+            result = dict(action='defer', reason=str(exc), message='Purchase remains pending review.')
+            self.state['decisions'][key] = dict(mode='provider-unavailable', review_on=self.dated(self.day + 2),
+                input=dict(role=role, as_of=self.date(), evidence=evidence), output=result)
+            self.persist()
+            self.log('purchase_review_unavailable', decision=key, role=role, reason=str(exc))
+            return result
+
     def approvals(self):
         ops=self.state['ops']
         purchase_docs={key:self.get(key,'SCM_MGR') for key,p in ops['purchases'].items() if not p.get('received')}
         for key,p in list(ops['purchases'].items()):
             if p.get('received'):continue
             po=purchase_docs[key]
-            if po['docstatus']==1:
-                if 'arrival_due' not in p:
-                    rng=random.Random(self.config['seed']+int(hashlib.sha256(key.encode()).hexdigest()[:8],16))
-                    p['arrival_due']=max(self.day+1,p['due']+math.ceil((self.regime()['supply']-1)*max(1,p['due']-p['day']))+rng.choice([-1,0,0,2]));p['approved_day']=self.day;self.persist()
+            if self.purchase_unavailable(po):
                 continue
-            if po.get('workflow_state')=='Rejected' or self.day<=p['day'] or self.day<p.get('review_after',0):continue
+            if po['docstatus']==1:
+                if 'arrival_due' not in p and not p.get('world_dispatched'):
+                    self.schedule_supplier_arrival(key, p, po)
+                    self.persist()
+                continue
+            if self.day<=p['day'] or self.day<p.get('review_after',0):continue
             first=not any(k.startswith('po-review:') for k in self.state['decisions'])
             usage=self.observed_usage()
             coverage=self.observe('SCM_MGR','Bin',{'item_code':['in',[r['item_code'] for r in po['items']]]},['item_code','warehouse','actual_qty'])
@@ -545,16 +944,32 @@ class Engine:
             evidence['receiving_policy']='Purchased materials are received into Quarantine, inspected by QA, then transferred to Raw Materials. Zero optional historical price fields indicate no previous purchase, not a conflicting quote.'
             coverage=[{'item_code':row['item_code'],'released_raw_materials_qty':sum(b['actual_qty'] for b in coverage if b['item_code']==row['item_code'] and b['warehouse']==self.wh['rm']),'quarantine_qty':sum(b['actual_qty'] for b in coverage if b['item_code']==row['item_code'] and b['warehouse']==self.wh['hold']),'open_po_qty_excluding_this':sum(max(0,r['qty']-r.get('received_qty',0)) for other in purchase_docs.values() if other['name']!=po['name'] and other['docstatus'] in (0,1) and other.get('workflow_state')!='Rejected' for r in other['items'] if r['item_code']==row['item_code'])} for row in po['items']]
             evidence.update(coverage=coverage,observed_daily_usage={r['item_code']:usage.get(r['item_code'],0) for r in po['items']},other_open_orders=self.observe('SCM_MGR','Purchase Order',{'docstatus':1,'status':['not in',['Closed','Completed']]},['name','supplier','grand_total']))
-            result=self.choose('po-review:'+key+':'+str(self.day),'SCM_MGR',evidence,'Decide this PO on its own current evidence: approve, defer, reject or investigate. Separately and optionally propose a scoped standing_policy effective tomorrow and reviewed in 14 days. Not having grounds for a policy is not a reason to defer this PO. The approval_limit applies per future PO; other_open_orders show observed supplier totals. Assess current observations rather than copying earlier reasons. Quarantine is the established receiving/inspection path, not a location conflict.',model=first)
+            if self.config.get('world'):
+                from native.company_world import evidence as world_evidence
+                evidence['carrier_observations'] = world_evidence(self, 'SCM_MGR')
+            decision_key = 'po-review:'+key+':'+str(self.day)
+            result=self.purchase_decision(decision_key,'SCM_MGR',evidence,'Decide this PO on its own current evidence: approve, defer, reject or investigate. Separately and optionally propose a scoped standing_policy effective tomorrow and reviewed in 14 days. Not having grounds for a policy is not a reason to defer this PO. The approval_limit applies per future PO; other_open_orders show observed supplier totals. Assess current observations rather than copying earlier reasons. Quarantine is the established receiving/inspection path, not a location conflict.',model=first)
             if result['action'] in ('approve','reject'):
                 action='Approve' if result['action']=='approve' else 'Reject'
-                doc=self.api['SCM_MGR'].call('frappe.model.workflow.apply_workflow',{'doc':json.dumps(po),'action':action});self.log('workflow_readback',role='SCM_MGR',doc=self.get(key,'SCM_MGR'))
-                if action=='Approve':
-                    rng=random.Random(self.config['seed']+int(hashlib.sha256(key.encode()).hexdigest()[:8],16))
-                    p['arrival_due']=max(self.day+1,p['due']+math.ceil((self.regime()['supply']-1)*max(1,p['due']-p['day']))+rng.choice([-1,0,0,2]));p['approved_day']=self.day
+                self.api['SCM_MGR'].call('frappe.model.workflow.apply_workflow', {'doc':json.dumps(po), 'action':action})
+                updated = self.get(key, 'SCM_MGR')
+                self.log('workflow_readback', role='SCM_MGR', doc=updated)
+                if action == 'Approve':
+                    self.schedule_supplier_arrival(key, p, updated)
             else:
-                p['review_after']=self.day+2
-                self.write('pending:'+key+':'+str(self.day),'ToDo',{'description':result['reason']+'; review '+self.dated(p['review_after']),'reference_type':'Purchase Order','reference_name':po['name'],'allocated_to':'buyer@norvale.test'},'SCM_MGR')
+                review_after = self.day + 2
+                fields = dict(description=result['reason']+'; review '+self.dated(review_after),
+                              reference_type='Purchase Order', reference_name=po['name'],
+                              allocated_to='buyer@norvale.test')
+                decision = self.state['decisions'].get(decision_key, {})
+                if decision.get('mode') == 'provider-unavailable' and decision.get('review_on'):
+                    fields['date'] = decision['review_on']
+                task = self.write('pending:'+key+':'+str(self.day), 'ToDo', fields, 'SCM_MGR')
+                if 'date' in fields:
+                    confirmed = self.api['BUYER'].get('ToDo', task['name'])
+                    if any(confirmed.get(field) != value for field, value in fields.items()):
+                        raise RuntimeError('Purchase buyer follow-up differs from the pending review')
+                p['review_after'] = review_after
             self.persist()
         for key,c in list(ops['changes'].items()):
             if c.get('implemented'):continue
@@ -576,16 +991,44 @@ class Engine:
                 c['implemented']=self.day;self.log('master_implemented',doc=doc)
             self.persist()
 
+    def record_supplier_arrival(self, key, purchase):
+        if 'arrived_day' not in purchase:
+            purchase['arrived_day'] = self.day
+            self.state['physical'][key] = {'arrived_day': self.day, 'items': purchase['items'], 'booked': False}
+            self.persist()
+            self.log('physical_arrival', purchase=key, items=purchase['items'])
+
     def arrivals(self):
         for key,p in self.state['ops']['purchases'].items():
-            if p.get('received') or 'arrival_due' not in p or self.day<p['arrival_due']:continue
+            if 'received' in p or 'arrival_due' not in p or self.day<p['arrival_due']:continue
+            po = self.get(key, 'WAREHOUSE')
+            if (self.purchase_unavailable(po) or po['docstatus'] != 1
+                    or not any(self.purchase_balance(row) for row in po['items'])):
+                # A receipt may have committed before the previous controller stopped.
+                # Recover that operation, while leaving other native receipts untouched.
+                receipt = self.recover_company_doc('receipt:'+key, 'Purchase Receipt', 'WAREHOUSE')
+                if not receipt or receipt['docstatus'] != 1:
+                    continue
             if 'arrived_day' not in p:
-                p['arrived_day']=self.day;self.state['physical'][key]={'arrived_day':self.day,'items':p['items'],'booked':False};self.persist()
-                self.log('physical_arrival',purchase=key,items=p['items'])
+                self.record_supplier_arrival(key, p)
             if self.day<p['arrived_day']+self.config['receipt_delay']:continue
-            doc=self.mapped('WAREHOUSE','erpnext.buying.doctype.purchase_order.purchase_order.make_purchase_receipt',existing=('receipt:'+key,'Purchase Receipt'),source_name=self.get(key)['name'])
-            for r in doc['items']:r['warehouse']=self.wh['hold']
-            self.write('receipt:'+key,'Purchase Receipt',doc,'WAREHOUSE',True)
+            lot_flow = getattr(self, 'company_erp', None)
+            def receive():
+                doc = self.mapped('WAREHOUSE', 'erpnext.buying.doctype.purchase_order.purchase_order.make_purchase_receipt',
+                                  existing=('receipt:'+key, 'Purchase Receipt'), source_name=self.get(key)['name'])
+                for row in doc['items']:
+                    row['warehouse'] = self.wh['hold']
+                if lot_flow:
+                    receipt = lot_flow.prepare_receipt('receipt:'+key, 'Purchase Receipt', doc, 'WAREHOUSE')
+                    lot_flow.receive(receipt, 'incoming', 'WAREHOUSE')
+                else:
+                    self.write('receipt:'+key, 'Purchase Receipt', doc, 'WAREHOUSE', True)
+                return True
+            if lot_flow:
+                if not lot_flow.attempt('receipt:'+key, 'WAREHOUSE', receive):
+                    continue
+            else:
+                receive()
             p['received']=self.day;self.state['physical'][key]['booked']=True;self.persist()
 
     def inspect_release(self,key,item,qty,reference,raw=False):
@@ -599,16 +1042,35 @@ class Engine:
         self.write('release:'+key,'Stock Entry',{'company':self.company,'stock_entry_type':'Material Transfer','items':[{'item_code':item,'qty':qty,'s_warehouse':self.wh['hold'],'t_warehouse':self.wh['rm'] if raw else self.wh['fg']}]},'QA',True)
 
     def inspections(self):
+        if self.config.get('company_operating'):
+            from integrations.company_run.operating import Operating
+            from integrations.company_run.timing import queue_samples
+            queue_samples(self, self.additions, self.additions.now + 1, Operating(self).eligible_samples())
         ops=self.state['ops']
+        lot_flow = getattr(self, 'company_erp', None)
+        if lot_flow:
+            lot_flow.attempt('quality-reconciliation', 'QA', lot_flow.inspections)
         for key,p in ops['purchases'].items():
             if 'received' not in p or 'invoice:'+key in ops['invoices']:continue
+            if lot_flow:
+                lot_flow.attempt('supplier-invoice:' + key, 'FINANCE', lambda: lot_flow.invoice_purchase(key))
+                continue
             if not p.get('released'):
-                for row in p['items']:self.inspect_release(key+':'+row['item_code'],row['item_code'],row['qty'],'receipt:'+key,True)
+                receipt = self.get('receipt:'+key, 'QA')
+                accepted = {}
+                for row in receipt['items']:
+                    code = row['item_code']
+                    accepted[code] = accepted.get(code, 0) + row['qty'] * (row.get('conversion_factor') or 1)
+                for code, quantity in accepted.items():
+                    if quantity > 0:
+                        self.inspect_release(key+':'+code,code,quantity,'receipt:'+key,True)
                 p['released']=self.day;self.persist()
             doc=self.mapped('FINANCE','erpnext.stock.doctype.purchase_receipt.purchase_receipt.make_purchase_invoice',existing=('invoice:'+key,'Purchase Invoice'),source_name=self.get('receipt:'+key)['name'])
             doc['due_date']=self.dated(self.day+5)
             self.write('invoice:'+key,'Purchase Invoice',doc,'FINANCE',True)
             ops['invoices']['invoice:'+key]={'due':self.day+5};self.persist()
+        if lot_flow:
+            return
         for key,p in ops['production'].items():
             if p.get('released') or self.day<=p['day']:continue
             self.inspect_release(key,p['item'],p['qty'],'manufacture:'+key)
@@ -617,40 +1079,60 @@ class Engine:
             self.persist()
 
     def production(self):
+        if self.config.get('company_operating'):
+            from integrations.company_run.operating import Operating
+            participant = Operating(self)
+            participant.definitions()
+        self.plan_production()
+        if self.config.get('company_operating'):
+            from integrations.company_run.timing import queue_dispatches
+            queue_dispatches(self, participant)
+
+    def plan_production(self):
         ops=self.state['ops']
+        lot_flow = getattr(self, 'company_erp', None)
+        if lot_flow:
+            lot_flow.retire_overplanned_work()
+            lot_flow.poll_work()
         def build():
-            if any(not m.get('closed') for m in ops['maintenance'].values()):return []
+            if not lot_flow and any(not m.get('closed') for m in ops['maintenance'].values()):return []
             stock=self.inventory('PLANNER');capacity=self.config['capacity_units'];out=[];short=[]
-            for key,order in ops['orders'].items():
-                if sum(p['qty'] for p in ops['production'].values() if p['order']==key)>=order['qty']:continue
-                doc=self.get(key,'PLANNER');row=doc['items'][0]
-                outstanding=float(row['qty'])-float(row.get('delivered_qty',0))
-                committed=sum(p['qty'] for p in ops['production'].values() if p['order']==key)
-                remaining=float(row['qty'])-committed
-                if outstanding<=0 or remaining<=0 or capacity<12:continue
-                bom=self.get('bom:'+order['item'],'PLANNER')['items']
-                available=min(stock.get((r['item_code'],self.wh['rm']),0)/r['qty'] for r in bom)
+            for key, order in ops['orders'].items():
+                row = self.get(key, 'PLANNER')['items'][0]
+                outstanding = float(row['qty']) - float(row.get('delivered_qty', 0))
+                committed = sum(p['qty'] for p in ops['production'].values() if p['order'] == key)
+                remaining = float(row['qty']) - committed
+                if outstanding <= 0 or remaining <= 0 or capacity < 12:
+                    continue
+                bom = self.get('bom:' + order['item'], 'PLANNER')
+                component_qty = {r['item_code']: r['qty'] for r in bom['items']}
+                available=min(stock.get((code,self.wh['rm']),0)/need for code,need in component_qty.items())
                 qty=int(min(remaining,capacity,available)//12)*12
                 if qty<=0:
-                    missing=[r['item_code'] for r in bom if stock.get((r['item_code'],self.wh['rm']),0)<r['qty']*min(remaining,12)]
+                    missing=[code for code,need in component_qty.items()
+                             if stock.get((code,self.wh['rm']),0)<need*min(remaining,12)]
                     short.extend(missing);continue
                 p={'key':f'd{self.day:04}-work-'+key,'order':key,'item':order['item'],'qty':qty,'day':self.day}
                 out.append(p);capacity-=qty
-                for r in bom:stock[(r['item_code'],self.wh['rm'])]=stock.get((r['item_code'],self.wh['rm']),0)-r['qty']*qty
+                for code, need in component_qty.items():
+                    stock[(code,self.wh['rm'])]=stock.get((code,self.wh['rm']),0)-need*qty
             return {'work':out,'shortages':sorted(set(short))}
-        plan=self.plan(build)
+        plan=self.plan(lot_flow.build_plan if lot_flow else build)
         if plan==[]:self.log('blocked',reason='Maintenance owns unavailable equipment');return
         for item in plan['shortages']:
             ops['shortage_days'].setdefault(item,[])
             if self.day not in ops['shortage_days'][item]:ops['shortage_days'][item].append(self.day)
             key='shortage:'+item
-            task=self.write(key,'ToDo',{'description':f'Planner observed missing released {item} for pending sales orders. Replenishment review required.','allocated_to':'scm_mgr@norvale.test'},'PLANNER')
+            task=self.write(key,'ToDo',{'description':f'Planner observed missing released {item} for pending sales orders. Replenishment review required.','allocated_to':'scm_mgr@norvale.test','date':self.dated(self.day+1)},'PLANNER')
             if len(ops['shortage_days'][item])>=2 and not any(c['item']==item for c in ops['changes'].values()):
                 change='change:'+item;level=math.ceil(self.observed_usage().get(item,1)*12)
                 self.write(change,'ToDo',{'description':f'Repeated native inventory shortage for {item}, observed days {ops["shortage_days"][item]}. Request reorder level {level}. Approval is not implementation.','allocated_to':'scm_mgr@norvale.test'},'BUYER')
                 ops['changes'][change]={'item':item,'level':level,'requested_day':self.day}
                 self.mail(change,'BUYER','SCM_MGR','Repeated shortage: master data request',self.get(change)['description'])
             self.persist()
+        if lot_flow:
+            lot_flow.production(plan)
+            return
         for p in plan['work']:
             from systems_v2 import operation_bom,job_cards,complete_job
             minutes_per_unit=self.config.get('shift_minutes',480)/self.config['capacity_units']
@@ -674,6 +1156,9 @@ class Engine:
             self.log('physical_production',native_work_order=wo['name'],item=p['item'],qty=p['qty'],completed_day=self.day)
 
     def fulfillment(self):
+        if getattr(self, 'company_erp', None):
+            self.company_erp.fulfillment()
+            return
         ops=self.state['ops']
         def build():
             stock=self.inventory('WAREHOUSE');out=[]
@@ -690,38 +1175,120 @@ class Engine:
             doc['items'][0]['qty']=p['qty'];self.write(p['key'],'Delivery Note',doc,'WAREHOUSE',True)
             self.state['physical'][p['key']]={'departed_day':self.day,'qty':p['qty'],'item':p['item']};self.persist()
             self.log('physical_dispatch',native_delivery=self.docs[p['key']]['name'],item=p['item'],qty=p['qty'],departed_day=self.day)
-            doc=self.mapped('FINANCE','erpnext.stock.doctype.delivery_note.delivery_note.make_sales_invoice',existing=('invoice:'+p['key'],'Sales Invoice'),source_name=self.get(p['key'])['name'])
-            doc['due_date']=self.dated(self.day+3)
-            self.write('invoice:'+p['key'],'Sales Invoice',doc,'FINANCE',True)
-            ops['invoices']['invoice:'+p['key']]={'due':self.day+3};self.persist()
+            self.invoice_delivery(p['key'], self.day)
+
+    def invoice_delivery(self, key, departed_day):
+        invoice_key = 'invoice:' + key
+        invoices = self.state['ops']['invoices']
+        if invoice_key in invoices:
+            return
+        delivery = self.get(key, 'WAREHOUSE' if getattr(self, 'company_erp', None) else None)
+        doc = self.mapped('FINANCE', 'erpnext.stock.doctype.delivery_note.delivery_note.make_sales_invoice',
+                          existing=(invoice_key, 'Sales Invoice'), source_name=delivery['name'])
+        doc['due_date'] = self.dated(max(self.day, departed_day + 3))
+        if getattr(self, 'company_erp', None):
+            from native.company_erp import Pending
+
+            fields = ('item_code', 'qty', 'uom', 'conversion_factor', 'stock_qty', 'rate')
+            expected = {row['name']: tuple(row[field] for field in fields) for row in delivery['items']}
+
+            def verify(invoice):
+                billed = {row.get('dn_detail'): tuple(row.get(field) for field in fields)
+                          for row in invoice['items'] if row.get('delivery_note') == delivery['name']}
+                if (delivery['docstatus'] != 1 or delivery.get('is_return') or invoice.get('is_return')
+                        or invoice.get('update_stock') or len(billed) != len(invoice['items']) or billed != expected
+                        or any(invoice.get(k) != delivery[k] for k in ('customer', 'company', 'currency'))):
+                    raise Pending('Invoice differs from the confirmed delivery')
+
+            verify(doc)
+            actual = self.write(invoice_key, 'Sales Invoice', doc, 'FINANCE', True, before_submit=verify)
+            verify(actual)
+        else:
+            self.write(invoice_key, 'Sales Invoice', doc, 'FINANCE', True)
+        invoices[invoice_key] = {'due': departed_day + 3}
+        self.persist()
+
+    def bank_statements(self):
+        from native.company_bank import BankReceipts
+        BankReceipts(self.company_erp).import_statements()
 
     def settlements(self):
+        if (self.config or {}).get('company_operating'):
+            from native.company_bank import BankReceipts
+            bank = BankReceipts(self.company_erp)
+            for key, invoice in self.state['ops']['invoices'].items():
+                if invoice.get('paid') is not None:
+                    continue
+                # Look for prepayments too, but only flag absent evidence once due.
+                result = self.company_erp.attempt('settle:' + key, 'FINANCE',
+                                                  lambda: bank.settle_invoice(key, overdue=self.day >= invoice['due']))
+                if result is None:
+                    continue
+                payments, outstanding = result
+                if payments:
+                    invoice['payment'] = payments[-1]
+                    invoice['payments'] = payments
+                    if outstanding == 0:
+                        invoice['paid'] = self.day
+                    self.persist()
+            return
         for key,p in self.state['ops']['invoices'].items():
-            if p.get('paid') or self.day<p['due']:continue
-            self.pay('pay:'+key,key);p['paid']=self.day;self.persist()
+            if p.get('paid') is not None or self.day<p['due']:continue
+            if getattr(self, 'company_erp', None):
+                payment = self.company_erp.attempt('settle:'+key, 'FINANCE', lambda:self.company_erp.settle(key))
+                if not payment:
+                    continue
+                p['payment'] = payment
+            else:
+                self.pay('pay:'+key,key)
+            p['paid']=self.day;self.persist()
 
     def service(self):
+        if getattr(self, 'company_erp', None):
+            return self.company_erp.equipment.service()
         from systems_v2 import Tickets
         tickets=Tickets(self.run)
         ops=self.state['ops']
+        title = 'Filler preventive service'
         for key,m in ops['maintenance'].items():
             if m.get('closed') or self.day<m['due']:continue
             doc=self.get(key,'MAINTENANCE')
-            if doc['status']!='Closed':self.api['MAINTENANCE'].update('ToDo',doc['name'],{'status':'Closed','description':doc['description']+' Technician inspection and restart test completed '+self.date()})
-            ticket=tickets.close(m['ticket'], 'Technician inspection and restart test completed '+self.date()+'. ERP task '+doc['name'])
-            if ticket['state']!='closed':raise RuntimeError('Ticket closure readback failed')
+            completion = ' Technician inspection and restart test completed ' + self.date()
+            if doc['status']!='Closed':
+                self.api['MAINTENANCE'].update('ToDo',doc['name'],{'status':'Closed','description':doc['description']+completion})
+            issue_body = m.get('issue_body')
+            if issue_body is None:
+                # Older checkpoints only kept the issue number and opening day.
+                issue_body = (doc['description'].removesuffix(completion) + ' ERP task ' + doc['name']
+                              + '; reported ' + self.dated(m['day']))
+            ticket = tickets.close(m['ticket'], completion.strip() + '. ERP task ' + doc['name'],
+                                   key=key, title=title, body=issue_body)
             self.log('ticket_readback',record=ticket)
             m['closed']=self.day;ops['serviced_meter']=m['meter'];self.log('maintenance_readback',doc=self.get(key,'MAINTENANCE'));self.persist()
         if ops['meter']-ops['serviced_meter']>=self.config['maintenance_units'] and not any(not m.get('closed') for m in ops['maintenance'].values()):
             key=f'service:{ops["meter"]}'
             self.write(key,'ToDo',{'description':f'Filler preventive service due after {ops["meter"]-ops["serviced_meter"]} produced units. Equipment unavailable until technician restart test.','allocated_to':'maintenance@norvale.test'},'MAINTENANCE')
-            ticket=tickets.open(key,'Filler preventive service',self.get(key)['description']+' ERP task '+self.get(key)['name']+'; reported '+self.date())
+            task = self.get(key)
+            issue_body = task['description'] + ' ERP task ' + task['name'] + '; reported ' + self.date()
+            ticket = tickets.open(key, title, issue_body)
             self.log('ticket_readback',record=ticket)
-            ops['maintenance'][key]={'day':self.day,'due':self.day+self.config['maintenance_days'],'meter':ops['meter'],'ticket':ticket['number']};self.persist()
             self.mail(key,'MAINTENANCE','PLANT_MGR','Filler unavailable for service',self.get(key)['description'])
+            ops['maintenance'][key]={'day':self.day,'due':self.day+self.config['maintenance_days'],'meter':ops['meter'],'ticket':ticket['number'],'issue_body':issue_body};self.persist()
 
     def management(self):
-        if (self.day+1)%self.config['report_every']:return
+        due = (self.day + 1) % self.config['report_every'] == 0
+        binding = self.run/'env/planning-report.json'
+        if binding.is_file():
+            from integrations.company_run.planning_report import reconcile
+            pending = self.state.setdefault('pending_planning_reports', [])
+            if due and self.date() not in pending and f'planning-backlog:{self.date()}' not in self.docs:
+                pending.append(self.date())
+                self.persist()
+            reconcile(self, binding)
+        if not due:
+            return
+        quarter = (self.day+1)//90
+        review_key = f'review:{self.day}'
         key=f'report:{self.day}'
         period=self.config['report_every']/30
         self.write('costs:'+key,'Journal Entry',{'company':self.company,'posting_date':self.date(),'accounts':[{'account':'Salary - NCC','debit_in_account_currency':round(2500*period,2)},{'account':'Utility Expenses - NCC','debit_in_account_currency':round(300*period,2)},{'account':'Cash - NCC','credit_in_account_currency':round(2500*period,2)+round(300*period,2)}],'user_remark':'Prorated aggregate wages/utilities; prototype, not employee payroll'},'FINANCE',True)
@@ -732,28 +1299,34 @@ class Engine:
         pending=self.observe('CFO','ToDo',{'status':'Open'},['name','description','allocated_to'])
         self.write(key,'Note',{'title':'Operating review '+self.date(),'public':0,'content':'<pre>'+json.dumps({'as_of':self.date(),'balances':totals,'outstanding_tasks':pending},indent=2)+'</pre>'},'CFO')
         urgent=any('urgent' in r.get('description','').lower() for r in pending)
-        if not urgent and (self.day+1)//90==self.state.get('management_quarter',0):return
-        result=self.choose('review:'+str(self.day),'CFO',{'report':self.get(key,'CFO')['name'],'native_balances':totals,'pending_requests':pending},'Review current financial records and pending requests. Approve the review or investigate/defer/reject with a concrete next request. Do not assume unseen production facts.',action='investigate',model=True)
-        self.state['management_quarter']=(self.day+1)//90;self.persist()
+        if not urgent and quarter == self.state.get('management_quarter', 0) and review_key not in self.state['decisions']:return
+        result=self.choose(review_key,'CFO',{'report':self.get(key,'CFO')['name'],'native_balances':totals,'pending_requests':pending},'Review current financial records and pending requests. Approve the review or investigate/defer/reject with a concrete next request. Do not assume unseen production facts.',action='investigate',model=True)
         if result['action']!='approve':self.write('followup:'+key,'ToDo',{'description':result['reason'],'allocated_to':'finance@norvale.test','date':self.dated(self.day+3)},'CFO')
         self.mail(key,'CFO','CEO','Periodic operating review',result['message'])
+        # The stage persists the checkpoint and completion together.
+        self.state['management_quarter']=quarter
     def recurring_events(self):
         yield 0,'seed',self.seed
         yield 0,'recurring-setup',self.recurring_setup
+        completed = set(self.state['completed']) if self.config.get('company_operating') else set()
         for day in range(self.config['days']):
             for phase in ['service','arrivals','inspections','demand','fulfillment','production','replenishment','approvals','settlements','management']:
+                if (phase == 'settlements' and self.config.get('company_operating')
+                        and f'd{day:04}:settlements' not in completed):
+                    yield day, f'd{day:04}:bank-statements', self.bank_statements
                 yield day,f'd{day:04}:{phase}',getattr(self,phase)
+            if 'company_timing' in self.config:
+                yield day, f'd{day:04}:native-clock', lambda day=day: self.run_additions((day + 1) * 1440 - 1)
 
     def through(self,day):
         """Safe Run All boundary: repeating a cell cannot pass its absolute day."""
-        while True:
-            pending=next(((d,k) for d,k,_ in self.events() if k not in self.state['completed']),None)
-            if pending is None or pending[0]>day:return
-            self.step()
+        while self.step(through_day=day) is not None:
+            pass
 
     def extend(self,days,demand_scale=None):
         if days<self.config['days']:raise ValueError('Cannot shorten recorded horizon')
-        if any(k not in self.state['completed'] for _,k,_ in self.events()):raise ValueError('Finish current horizon before changing its future demand')
+        completed = set(self.state['completed'])
+        if any(k not in completed for _,k,_ in self.events()):raise ValueError('Finish current horizon before changing its future demand')
         before=dict(self.config);self.config['days']=days
         if demand_scale is not None:self.config['demand_scale']=float(demand_scale)
         self.validate_config(self.config);save(self.run/'config.json',self.config)
@@ -761,11 +1334,38 @@ class Engine:
 
     @staticmethod
     def validate_config(c):
+        from engine.world import validate
+        validate(c)
         if not 1<=c['days']<=365:raise ValueError('days must be 1..365')
         if not 1<=c['orders_per_day']<=18:raise ValueError('orders_per_day must be 1..18')
         if not 0<c['demand_scale']<=1:raise ValueError('demand_scale must be in (0,1]')
         for k in ['capacity_units','maintenance_units','maintenance_days','report_every','receipt_delay']:
             if c[k]<=0:raise ValueError(k+' must be positive')
+        if 'company_authority' in c:
+            factory = c['company_authority']
+            if not isinstance(factory, str) or len(factory.split(':')) != 2 or not all(factory.split(':')):
+                raise ValueError('company_authority must be module:factory')
+        if 'company_operating' in c and (c['company_operating'] is not True
+                or 'company_timing' not in c
+                or c.get('company_authority') != 'integrations.company_run.authority:Authority'):
+            raise ValueError('Operating mode requires native company authority and timing')
+        if 'supplier_quality' in c and (type(c['supplier_quality']) is not bool or not c.get('company_operating')):
+            raise ValueError('Supplier quality sampling requires an ordinary operating run and a boolean setting')
+        if 'company_timing' in c:
+            from engine import _calendars
+            timing = c['company_timing']
+            if (not c.get('company_authority') or not isinstance(timing, dict)
+                    or type(timing.get('lab_minutes')) is not int or timing['lab_minutes'] <= 0
+                    or not {'PRODUCTION', 'LAB'} <= _calendars(timing).keys()
+                    or type(c.get('shift_minutes', 480)) is not int or c.get('shift_minutes', 480) <= 0):
+                raise ValueError('Company timing requires authority, PRODUCTION and LAB shifts, and positive minutes')
+            for field in ('staff', 'task_minutes'):
+                values = timing.get(field, {})
+                if not isinstance(values, dict) or any(type(v) is not int or v <= 0 for v in values.values()):
+                    raise ValueError(f'Company timing {field} requires positive integers')
+            if 'quality_due_minutes' in timing and (type(timing['quality_due_minutes']) is not int
+                                                    or timing['quality_due_minutes'] <= 0):
+                raise ValueError('Quality due time must be positive business-clock minutes')
         if c['opening_stock_days']<0:raise ValueError('opening_stock_days must be nonnegative')
 
     def events(self):
@@ -801,39 +1401,98 @@ class Engine:
         yield 29,'monthly-review',self.report
         yield 30,'cfo-review',self.management_review
 
-    def step(self, expected=None):
+    def step(self, expected=None, *, through_day=None):
         with (self.run/'execution.lock').open('w') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
             if (self.run/'state.json').exists():
                 self.state=json.loads((self.run/'state.json').read_text());self.docs=self.state['docs'];self.day=self.state['day']
-            if expected and expected in self.state['completed']:return {'event':expected,'already_completed':True}
-            pending=next((k for _,k,_ in self.events() if k not in self.state['completed']),None)
-            if expected and expected!=pending:raise ValueError(f'Next stage is {pending}, not {expected}')
-            return self._step()
+            completed = set(self.state['completed'])
+            if expected and expected in completed:
+                return {'event': expected, 'already_completed': True}
+            stage = next((stage for stage in self.events() if stage[1] not in completed), None)
+            pending = stage[1] if stage else None
+            if expected and expected != pending:
+                raise ValueError(f'Next stage is {pending}, not {expected}')
+            if through_day is not None and (stage is None or stage[0] > through_day):
+                return None
+            return self._step(stage)
 
-    def _step(self):
-        for day,key,action in self.events():
-            if key in self.state['completed']:continue
+    def _step(self, stage):
+        if stage is not None:
+            day, key, action = stage
             self.day=day;self.event=key
-            target=datetime(2027,1,1,12,tzinfo=timezone.utc)+timedelta(days=day)
-            if self.stack.clock.now()<target:
-                self.stack.settle();self.stack.clock.advance_to(target)
             start=time.monotonic()
-            try:action()
+            try:
+                self.run_phase(day, key, action)
             except Exception as exc:
                 self.log('failed',error=str(exc));raise
             self.state['completed'].append(key);self.persist()
             result={'event':key,'day':day,'seconds':round(time.monotonic()-start,3),'native_documents':len(self.docs)}
             self.log('completed',**{'result':result});return result
+        if self.config:
+            self.run_additions(self.config['days']*1440-1)
+            if self.config.get('company_operating'):
+                from integrations.company_run.lake import scheduled_scan
+                scheduled_scan(self, self.config['days'] * 1440 - 1)
+            if self.state.get('pending_planning_reports'):
+                from integrations.company_run.planning_report import reconcile
+                reconcile(self, self.run/'env/planning-report.json')
         return None
+
+    def run_phase(self, day, key, action):
+        from native.recurring_extensions import COMPANY_OPEN, DAY, MIDNIGHT
+        minute = day * DAY + (COMPANY_OPEN if 'company_timing' in (self.config or {}) else 720)
+        if self.config and key.startswith(f'd{day:04}:'):
+            self.run_additions(minute)
+            # Queued native work can checkpoint a different day and event ID.
+            self.day, self.event = day, key
+        self.advance_clock(MIDNIGHT + timedelta(minutes=minute))
+        if self.config and self.config.get('company_operating') and key.endswith(':management'):
+            from integrations.company_run.lake import scheduled_scan
+            scheduled_scan(self, minute)
+        action()
+        if self.config and self.config.get('company_operating'):
+            self.day, self.event = day, key
+            if key.endswith(':settlements') and self.state.get('company_erp', {}).get('shipments'):
+                event_id = f'finance-sales-readback:{day}'
+                if not self.additions.has_event(event_id):
+                    self.additions.schedule(event_id, 'company-sales-readback', self.additions.now,
+                                            payload={}, role='FINANCE')
+                self.run_additions(self.additions.now)
+            if key.endswith(':native-clock'):
+                from integrations.company_run.lake import scheduled_scan
+                scheduled_scan(self, (day + 1) * DAY - 1)
+
+    def scheduled_company_event(self, clock, payload):
+        if not self.config.get('company_operating'):
+            raise RuntimeError('Run scheduled qualification work through integrations.company_run')
+        from integrations.company_run.timing import dispatch_event
+        return dispatch_event(self, clock, payload)
+
+    def advance_clock(self, target):
+        if self.stack.clock.now()<target:
+            self.stack.settle();self.stack.clock.advance_to(target)
+
+    def run_additions(self, until):
+        from native.recurring_extensions import open_catalog
+        if self.additions is None:
+            self.additions=open_catalog(self.run, self.config, self.state, self.advance_clock, company=self)
+        self.additions.run(until=until, advance=True)
 
     def run_all(self):
         import urllib.error
         attempts=0
         while True:
             try:event=self.step()
-            except (urllib.error.URLError,TimeoutError,json.JSONDecodeError,ErpError) as exc:
-                transient=not isinstance(exc,ErpError) or exc.status in (408,429,500,502,503,504)
+            except (urllib.error.URLError, TimeoutError, ConnectionError, SMTPServerDisconnected,
+                    SMTPResponseException, SMTPRecipientsRefused, IMAP4.abort, json.JSONDecodeError, ErpError) as exc:
+                transient = True
+                if isinstance(exc, ErpError):
+                    transient = exc.status in (408, 429, 500, 502, 503, 504)
+                elif isinstance(exc, SMTPResponseException):
+                    transient = 400 <= exc.smtp_code < 500
+                elif isinstance(exc, SMTPRecipientsRefused):
+                    transient = all(400 <= code < 500 for code, _ in exc.recipients.values())
                 if not transient or attempts>=3:raise
                 attempts+=1;self.log('stage_retry',attempt=attempts,error=str(exc));time.sleep(2**attempts);continue
             if event is None:return
@@ -841,9 +1500,16 @@ class Engine:
 
 DEFAULT_CONFIG={'days':120,'seed':42,'demand_scale':0.02,'orders_per_day':3,'opening_stock_days':14,'capacity_units':600,'maintenance_units':3000,'shift_minutes':480,'maintenance_days':2,'report_every':7,'receipt_delay':1}
 
-def initialize(path, config=None):
+def writable_run(path):
     path=Path(path).resolve()
-    if path==Path(path.anchor):raise ValueError('Choose a dedicated run directory')
+    for frozen in (ROOT/'data', RUN):
+        frozen=frozen.resolve()
+        if path.is_relative_to(frozen) or frozen.is_relative_to(path):
+            raise ValueError('Choose a dedicated run directory outside frozen evidence')
+    return path
+
+def initialize(path, config=None, *, company_authority=None):
+    path=writable_run(path)
     if (path/'config.json').exists():
         existing=json.loads((path/'config.json').read_text())
         if config is not None and config!=existing:raise ValueError('Existing run config differs; choose a new directory or explicitly extend the finished horizon')
@@ -853,18 +1519,63 @@ def initialize(path, config=None):
         config=dict(DEFAULT_CONFIG) if config is None else config
         Engine.validate_config(config);save(path/'config.json',config)
     if not (path/'env/site-created').exists():provision(path)
-    return Engine(path)
+    return Engine(path, company_authority=company_authority)
 
-if __name__=='__main__':
+def main(argv=None):
     import argparse
-    p=argparse.ArgumentParser();p.add_argument('--provision',action='store_true');p.add_argument('--run',type=Path,default=RUN.parent/'recurring-run');p.add_argument('--days',type=int);p.add_argument('--demand-scale',type=float);a=p.parse_args()
-    if a.provision:
-        config=dict(DEFAULT_CONFIG)
-        if a.days is not None:config['days']=a.days
-        if a.demand_scale is not None:config['demand_scale']=a.demand_scale
-        initialize(a.run,config)
-    else:
+    p=argparse.ArgumentParser()
+    mode=p.add_mutually_exclusive_group()
+    mode.add_argument('--provision',action='store_true')
+    mode.add_argument('--extend',type=Path,help='Queue catalog additions for an existing recurring run')
+    p.add_argument('--run',type=Path,default=ACTIVE_RUN)
+    p.add_argument('--days',type=int)
+    p.add_argument('--company-authority')
+    p.add_argument('--company-operating', action='store_true',
+                   help='Provision a fresh timed run for the native company participants')
+    p.add_argument('--world', action='store_true', help='Enable seeded world processes in a fresh recurring run')
+    p.add_argument('--demand-scale',type=float)
+    a=p.parse_args(argv)
+    try:
+        a.run=writable_run(a.run)
+        if a.world and not a.provision:
+            p.error('--world requires --provision with a fresh run directory')
+        if a.company_authority is not None and not a.provision:
+            p.error('--company-authority requires --provision')
+        if a.company_operating and (not a.provision or a.company_authority):
+            p.error('--company-operating requires --provision and selects its company authority')
+        if a.extend is not None:
+            if a.days is not None or a.demand_scale is not None:
+                p.error('--extend cannot change the horizon or demand scale')
+            from native.recurring_extensions import submit
+            return submit(a.run, a.extend)
+        if a.provision:
+            config=dict(DEFAULT_CONFIG)
+            if a.world:
+                os.umask(0o077)
+                config['world'] = True
+            if a.days is not None:config['days']=a.days
+            if a.demand_scale is not None:config['demand_scale']=a.demand_scale
+            if a.company_authority is not None:config['company_authority']=a.company_authority
+            if a.company_operating:
+                from integrations.company_run.timing import DEFAULT_TIMING
+                os.umask(0o077)
+                config.update(company_operating=True, supplier_quality=True, company_timing=DEFAULT_TIMING,
+                              company_authority='integrations.company_run.authority:Authority')
+            initialize(a.run,config)
+            return
+        if a.demand_scale is not None and a.days is None:
+            p.error('--demand-scale on an existing run requires --days to extend its future')
+        config_path = a.run/'config.json'
+        if config_path.exists() and json.loads(config_path.read_text()).get('company_operating'):
+            os.umask(0o077)
+            if not (a.run/'env/company-sources.json').is_file():
+                p.error('Configure native company sources before running the operating participants')
         e=Engine(a.run)
         if a.days is not None:e.extend(a.days,a.demand_scale)
-        elif a.demand_scale is not None:p.error('--demand-scale on an existing run requires --days to extend its future')
-        e.run_all()
+    except (ValueError, OSError) as exc:
+        p.error(str(exc))
+    e.run_all()
+
+
+if __name__=='__main__':
+    main()

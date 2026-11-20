@@ -1,5 +1,5 @@
 """Provision the isolated real Gitea application; no simulation events."""
-import json, secrets, subprocess, time, urllib.request
+import json, subprocess, time, urllib.request
 from systems_v2 import RUN, stack_for, save
 from norvale.environment import docker
 import sys
@@ -23,9 +23,8 @@ for attempt in range(120):
 else: raise RuntimeError('Gitea unavailable')
 p = RUN/'env/tickets.json'
 if not p.exists():
-    password = secrets.token_urlsafe(32)
     r = s.compose('exec','-T','--user','git','tickets','gitea','admin','user','create',
-        '--username','controller','--password',password,'--email','controller@norvale.test',
+        '--username','controller','--random-password','--random-password-length','43','--email','controller@norvale.test',
         '--admin','--must-change-password=false',capture_output=True,text=True)
     r = s.compose('exec','-T','--user','git','tickets','gitea','admin','user','generate-access-token',
         '--username','controller','--token-name','native-v2','--scopes','all','--raw',capture_output=True,text=True)
@@ -34,7 +33,10 @@ from systems_v2 import Tickets
 t = Tickets(RUN)
 try:t.request('GET','/repos/controller/operations')
 except Exception:t.request('POST','/user/repos',{'name':'operations','private':True,'has_issues':True})
-issue=t.open('integration-smoke','Integration connectivity check','Scripted integration check; no simulated work performed.')
-assert t.close(issue['number'],'Native API persistence verified')['state']=='closed'
+key = 'integration-smoke'
+title = 'Integration connectivity check'
+body = 'Scripted integration check; no simulated work performed.'
+issue = t.open(key, title, body, allow_closed=True)
+assert t.close(issue['number'], 'Native API persistence verified', key=key, title=title, body=body)['state']=='closed'
 save(RUN/'ticket-check.json',{'application':'Gitea','issue':issue['number'],'state':'closed'})
 print('Gitea native issue persisted and closed')

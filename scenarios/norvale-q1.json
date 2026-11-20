@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "seed": 42,
+  "days": 90,
+  "opening_orders": [
+    {"customer": "CUST-5001", "item": "SKU-30001", "quantity": 240, "due_day": 2},
+    {"customer": "CUST-5002", "item": "SKU-30002", "quantity": 180, "due_day": 2},
+    {"customer": "CUST-5003", "item": "SKU-30003", "quantity": 120, "due_day": 3},
+    {"customer": "CUST-5004", "item": "SKU-30004", "quantity": 180, "due_day": 3}
+  ]
+}

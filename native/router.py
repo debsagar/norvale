@@ -6,6 +6,21 @@ import urllib.error
 import time
 from pathlib import Path
 
+class ProviderUnavailable(RuntimeError):
+    """The routing or judgment endpoint exhausted its transport retries."""
+
+
+def provider_json(provider, request, on_attempt):
+    try:
+        return request_json(request, on_attempt)
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (408, 429, 500, 502, 503, 504):
+            raise
+        raise ProviderUnavailable(f'{provider} unavailable (HTTP {exc.code})') from exc
+    except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
+        raise ProviderUnavailable(f'{provider} unavailable ({type(exc).__name__})') from exc
+
+
 def route(evidence, memory, policies, on_attempt=None):
     # Routing needs effective rules and current observations, not recursive policy provenance.
     policies=[{k:p.get(k) for k in ['role','effective_date','review_date','approval_limit','reorder_target','suppliers','items']} for p in policies]
@@ -19,7 +34,7 @@ def route(evidence, memory, policies, on_attempt=None):
         'state': {'evidence': evidence, 'cases': memory, 'policies': policies}}
     req = urllib.request.Request('https://api.typesafe.ai/v1/systemone', json.dumps(body).encode(),
         headers={'Authorization': 'Bearer ' + os.environ['TYPESAFE_API_KEY'], 'Content-Type': 'application/json'})
-    try:raw=request_json(req,on_attempt)
+    try:raw=provider_json("JEV",req,on_attempt)
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f'JEV HTTP {exc.code}: {exc.read().decode()[:300]}; request bytes={len(req.data)}') from None
     probability = raw['answers']['judgment']['noul']
@@ -28,13 +43,14 @@ def route(evidence, memory, policies, on_attempt=None):
     return {'judgment': probability >= .5, 'probability': probability, 'request': body, 'response': raw}
 
 
-def request_json(request,on_attempt=None):
-    for attempt in range(4):
+def request_json(request,on_attempt=None,*,attempts=4):
+    for attempt in range(attempts):
         if on_attempt:on_attempt(attempt+1)
         try:
-            with urllib.request.urlopen(request,timeout=90) as response:return json.load(response)
+            with urllib.request.urlopen(request,timeout=90) as response:
+                return None if getattr(response, 'status', None) == 204 else json.load(response)
         except urllib.error.HTTPError as exc:
-            if exc.code not in (408,429,500,502,503,504) or attempt==3:raise
+            if exc.code not in (408,429,500,502,503,504) or attempt==attempts-1:raise
         except (urllib.error.URLError,TimeoutError):
-            if attempt==3:raise
+            if attempt==attempts-1:raise
         time.sleep(2**attempt)

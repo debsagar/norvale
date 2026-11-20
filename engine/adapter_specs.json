@@ -1,0 +1,8 @@
+{
+  "erpnext-sales": {
+    "settings": "erp",
+    "fields": ["url", "site", "company", "customer", "item", "warehouse"],
+    "origin": "url",
+    "credential": "token_env"
+  }
+}

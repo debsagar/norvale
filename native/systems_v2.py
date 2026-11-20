@@ -75,9 +75,17 @@ def complete_job(engine, name, employee, start, end, quantity):
 
 class Tickets:
     """Gitea Issues REST API; credentials loaded privately, records in Gitea DB."""
-    def __init__(self, run=RUN):
+    repo = 'controller/operations'
+
+    def __init__(self, run=RUN, *, token=None, target=None):
         self.run = Path(run)
+        if target is not None:
+            self.repo = target['repo']
+            self.config = {'url': target['url'].rstrip('/'), 'token': token}
+            return
         self.config = json.loads((self.run / 'env/tickets.json').read_text())
+        if token is not None:
+            self.config['token'] = token
         from norvale.environment import docker
         self.config['url']='http://'+docker.container_ip(project(self.run),'tickets')+':3000'
 
@@ -86,30 +94,98 @@ class Tickets:
             data=None if body is None else json.dumps(body).encode(), method=method,
             headers={'Authorization': 'token ' + self.config['token'], 'Content-Type': 'application/json'})
         from router import request_json
-        return request_json(req)
+        # A stage retry rechecks native records before repeating a creation.
+        return request_json(req, attempts=1 if method == 'POST' else 4)
 
     def records(self):
         result = []
         page = 1
         while True:
-            rows = self.request('GET', f'/repos/controller/operations/issues?state=all&limit=50&page={page}')
+            rows = self.request('GET', f'/repos/{self.repo}/issues?state=all&limit=50&page={page}')
             result.extend(rows)
             if len(rows) < 50:
                 return result
             page += 1
 
-    def open(self, key, title, body):
-        marker = '<!-- reference:' + hashlib.sha256(key.encode()).hexdigest() + ' -->'
-        for row in self.records():
-            if marker in (row.get('body') or ''):
-                return row
-        return self.request('POST', '/repos/controller/operations/issues',
-                            {'title': title, 'body': marker + '\n' + body})
+    def comments(self, number):
+        result = []
+        page = 1
+        while True:
+            rows = self.request('GET', f'/repos/{self.repo}/issues/{number}/comments?limit=50&page={page}')
+            result.extend(rows)
+            if len(rows) < 50:
+                return result
+            page += 1
 
-    def close(self, number, resolution):
-        comments=self.request('GET',f'/repos/controller/operations/issues/{number}/comments')
-        if not any(r['body']==resolution for r in comments):self.request('POST', f'/repos/controller/operations/issues/{number}/comments', {'body': resolution})
-        return self.request('PATCH', f'/repos/controller/operations/issues/{number}', {'state': 'closed'})
+    @staticmethod
+    def marker(key):
+        return '<!-- reference:' + hashlib.sha256(key.encode()).hexdigest() + ' -->'
+
+    def native_id(self, operation, find_or_create):
+        # A successful mutation supplies identity only. Keep it across a failed readback.
+        path = self.run / 'ticket-operations.json'
+        operations = json.loads(path.read_text()) if path.exists() else {}
+        if operation not in operations:
+            operations[operation] = find_or_create()
+            save(path, operations)
+        return operations[operation]
+
+    def verify_issue(self, number, key, title, body, states):
+        issue = self.request('GET', f'/repos/{self.repo}/issues/{number}')
+        if (issue.get('number') != number or issue.get('state') not in states
+                or issue.get('title') != title or issue.get('body') != self.marker(key) + '\n' + body):
+            raise RuntimeError('Ticket issue readback differs from intended record')
+        return issue
+
+    def open(self, key, title, body, *, allow_closed=False):
+        marker = self.marker(key)
+
+        def find_or_create():
+            matches = [row for row in self.records() if marker in (row.get('body') or '')]
+            if len(matches) > 1:
+                raise RuntimeError('Duplicate ticket operation reference')
+            if matches:
+                return matches[0]['number']
+            issue = self.request('POST', f'/repos/{self.repo}/issues',
+                                 {'title': title, 'body': marker + '\n' + body})
+            return issue['number']
+
+        number = self.native_id(f'issue:{key}', find_or_create)
+        states = ('open', 'closed') if allow_closed else ('open',)
+        return self.verify_issue(number, key, title, body, states)
+
+    def close(self, number, resolution, *, key, title, body):
+        path = f'/repos/{self.repo}/issues/{number}'
+        issue = self.verify_issue(number, key, title, body, ('open', 'closed'))
+        marker = self.marker('resolution:' + key)
+        expected = marker + '\n' + resolution
+
+        def find_or_create():
+            matches = []
+            page = 1
+            while True:
+                comments = self.request('GET', f'{path}/comments?limit=50&page={page}')
+                matches.extend(row for row in comments if marker in row['body'] or row['body'] == resolution)
+                if len(comments) < 50:
+                    break
+                page += 1
+            if len(matches) > 1:
+                raise RuntimeError('Duplicate ticket resolution reference')
+            if matches:
+                return {'id': matches[0]['id'], 'legacy': matches[0]['body'] == resolution}
+            return {'id': self.request('POST', f'{path}/comments', {'body': expected})['id'],
+                    'legacy': False}
+
+        identity = self.native_id(f'resolution:{key}:{number}', find_or_create)
+        comment_id = identity['id']
+        comment = self.request('GET', f'/repos/{self.repo}/issues/comments/{comment_id}')
+        if (comment.get('id') != comment_id
+                or comment.get('body') != (resolution if identity['legacy'] else expected)
+                or not (comment.get('issue_url') or '').endswith(f'/{self.repo}/issues/{number}')):
+            raise RuntimeError('Ticket comment readback differs from intended resolution')
+        if issue['state'] != 'closed':
+            self.request('PATCH', path, {'state': 'closed'})
+        return self.verify_issue(number, key, title, body, ('closed',))
 
 
 def export_native(run=RUN):
@@ -129,7 +205,7 @@ def export_native(run=RUN):
     t = Tickets(run)
     issues = t.records()
     for issue in issues:
-        issue['exported_comments'] = t.request('GET',f'/repos/controller/operations/issues/{issue["number"]}/comments')
+        issue['exported_comments'] = t.request('GET',f'/repos/{t.repo}/issues/{issue["number"]}/comments')
     save(out / 'tickets.json', issues)
     private = Path(run) / 'private'
     private.mkdir(exist_ok=True)

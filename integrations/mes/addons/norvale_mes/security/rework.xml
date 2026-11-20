@@ -1,0 +1,6 @@
+<odoo>
+    <record id="group_rework_bridge" model="res.groups">
+        <field name="name">Norvale QMS Rework Bridge</field>
+        <field name="implied_ids" eval="[(4, ref('mrp.group_mrp_manager')), (4, ref('stock.group_stock_manager'))]"/>
+    </record>
+</odoo>

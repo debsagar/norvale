@@ -1,0 +1,2 @@
+deltalake==1.2.1
+pyarrow==25.0.0

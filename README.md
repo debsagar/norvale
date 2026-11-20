@@ -13,6 +13,43 @@ Norvale is a synthetic consumer-care manufacturer whose people perform modeled b
 
 GitHub displays HTML source; download the repository and open HTML files locally for interaction. The separate [public presentation](https://norvale-company-v2.aswanth-krshna.chatgpt.site) is also available.
 
+## Run the native company
+
+Validate the scenario and inspect the opening orders without starting any services:
+
+```sh
+python3 simulate.py --scenario scenarios/norvale-q1.json --run /absolute/path/to/q1 --plan
+```
+
+The starter scenario covers January 1 through March 31, 2027. Four submitted customer orders (720 units) enter the ordinary planning queue before day-one demand. Change the seed, dates relative to opening day, customers, SKUs or quantities in the versioned JSON.
+
+For a live run, install the [runtime prerequisites](docs/GENERATING.md), including cached service images, the shared clock library and [Delta dependencies](integrations/lake/requirements.txt). Set `NORVALE_CLOCK_LIB`, `TYPESAFE_API_KEY` and either `OPENAI_API_KEY` or `OPENROUTER_API_KEY`. Remove `--plan` to provision **one** private stack, seed ERPNext, and run the ordinary company with InvenTree PLM, Odoo MES, separate QMS, scheduled Delta ingestion and live decision routing. This command creates containers and can incur provider charges.
+
+Use the same command and run directory to resume after successful commissioning. The directory holds a private release snapshot and Git revision, scenario, business checkpoint, source settings, and lake archive. Keep it outside version control. If commissioning fails, inspect that run’s `provision.log` and service logs before retrying; the launcher refuses to allocate another stack in its place. Use a release tag or commit for future runs and the original pinned source for an existing run. The published 120-day dataset came from the earlier ERPNext, tickets and mail generator. A new live Q1 run is still subject to native commissioning and verification.
+
+### Pause, resume and restore a company
+
+Use the same runtime path throughout. These commands select existing containers by the run’s Compose file and project labels. They work independently of provider credentials. Finish or interrupt the generator before stopping its services.
+
+```sh
+python3 simulate.py --run /absolute/private/path/q1 --services status
+python3 simulate.py --run /absolute/private/path/q1 --services stop
+python3 simulate.py --run /absolute/private/path/q1 --services start
+```
+
+Stop keeps the containers, networks and volumes. Start brings up the existing database and Redis containers first. Check application readiness before resuming the same scenario command. Newly commissioned runs keep fixed loopback ports for ERP, QMS, MES and PLM. Older runs may have ephemeral addresses; verify them against their commissioned bindings after restarting.
+
+For a recoverable version checkpoint, stop the controller and its containers at a confirmed business phase, then back up the private runtime directory **and all named volumes for its four Compose projects** at that same point. Protect the backups as credentials. Restore the matching volumes, networks, runtime path, source revision and image versions together on an isolated host and verify native IDs, balances and lake watermarks before resuming. Reverting Git alone leaves the databases and schema at their later versions.
+
+After day 90, generate cutoff-specific extractor questions from the run’s own trace:
+
+```sh
+python3 /absolute/private/path/q1/release/native/build_evidence.py \
+  --run /absolute/private/path/q1/business --cutoff 89 --out /absolute/private/path/q1-grading
+```
+
+Share `public-examples.json` with dataset consumers. Keep `private/reference.json` with the evaluator. Each question’s evidence refers to the software records available at the selected cutoff.
+
 ## What was generated
 
 | Record | Count |

@@ -54,6 +54,14 @@ Methods above are in `native/company.py` unless qualified. These are not twelve 
 
 The external-factor implementation currently samples persistent episodes and recovery. It is STOCKTAKE-inspired, not a fitted HMM. JEV classifies whether judgment is needed; it does not choose the business action. Routine operations can execute without consulting JEV. See the dated routing limitation in PROVENANCE.md.
 
+## Native confirmation and routing reuse
+
+D applies the simulated date as an additional AND predicate on dated ERP reads. An explicit equality, lower bound or existing AND-filter list remains in force. F reuses a routine classification only when the effective policy and the decision evidence match. Receipt and open-order rows and coverage rows are compared independent of their read order. Usage, quantities, dates, prices and other visible evidence are compared by value.
+
+J records an uncertain SMTP attempt before submission and records acceptance before connection teardown. K confirms delivery by opening the full message in the intended recipient's IMAP inbox and checking identity, reference, subject and body. The pending checkpoint survives a restart. L reconciles accepted or uncertain mail through IMAP on retry and keeps it pending if delivery is still absent. A definitive SMTP rejection permits a later attempt. SMTP acceptance only confirms that the server took responsibility. A dropped reply or a process exit during submission can leave the result unknowable from the client, and an empty inbox can mean late, failed or missing delivery. An unresolved operation requires checking the mail service before an operator authorizes another submission. A stable Message-ID helps correlation, but SMTP does not guarantee deduplication.
+
+J uses Gitea mutation responses to identify new issues and comments. K reads the issue and resolution independently and checks their reference, content, association and issue state before recording progress. A successful mutation's identity is checkpointed for retry. Recovery from a lost POST reply depends on the operation reference becoming visible in Gitea.
+
 ## Example: maintenance across systems
 
 Production accumulates equipment use (C). A maintenance issue is opened through Gitea (J), its identifier is read back (K), and work remains pending until service completes. Mail and ERP records provide related evidence (D). The issue is closed after the modeled repair; subsequent production can resume. A ticket alone does not prove a repair occurred.
@@ -61,3 +69,7 @@ Production accumulates equipment use (C). A maintenance issue is opened through 
 ## Change contract
 
 Every contribution should state: **affected A–L blocks → input evidence → decision/action → native records and links → check**. If a new application is added, wire its identities at A, reads at D, actions at J and readback/export at K. Keep this diagram and the focused notebook aligned. Preserve the diagram's stable labels; do not replace the company objective with a single-process demo.
+
+## Proposed company behavior and integrations
+
+[Company logic architecture](COMPANY-LOGIC.md) grounds the proposed MES, QMS, PLM and lakehouse integration in manufacturing workflows, record ownership, guards and failure recovery. It extends this A–L contract; it is not a claim of implemented integrations.

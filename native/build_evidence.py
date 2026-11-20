@@ -22,15 +22,155 @@ def outside(run, out):
         raise ValueError('Output must be outside the run directory')
 
 
+def matches_bank_clearance(voucher, statement):
+    """The native voucher must be the exact fully reconciled statement allocation."""
+    incoming = voucher.get('payment_type') == 'Receive'
+    amount = voucher.get('received_amount' if incoming else 'paid_amount')
+    currency = voucher.get('paid_to_account_currency' if incoming else 'paid_from_account_currency')
+    refs = statement.get('payment_entries') or []
+    return (statement.get('docstatus') == 1 and statement.get('status') == 'Reconciled'
+            and statement.get('unallocated_amount') == 0 and voucher.get('docstatus') == 1
+            and voucher.get('clearance_date') and statement.get('date') == voucher['clearance_date']
+            and len(refs) == 1 and refs[0].get('payment_document') == 'Payment Entry'
+            and refs[0].get('payment_entry') == voucher['name']
+            and voucher.get('payment_type') in ('Pay', 'Receive')
+            and currency and statement.get('currency') == currency
+            and (amount or 0) > 0 and refs[0].get('allocated_amount') == amount
+            and statement.get('deposit' if incoming else 'withdrawal') == amount
+            and statement.get('withdrawal' if incoming else 'deposit') == 0)
+
+
+INVOICES = {
+    'Sales Invoice': ('Customer', 'Delivery Note', 'delivery_note', 'dn_detail', 'debit_to'),
+    'Purchase Invoice': ('Supplier', 'Purchase Receipt', 'purchase_receipt', 'pr_detail', 'credit_to'),
+}
+
+def shipment_rows(invoice, docs):
+    party, entity, parent_field, row_field, _ = INVOICES[invoice['doctype']]
+    result = []
+    used = set()
+    for row in invoice.get('items', []):
+        parent = docs.get((entity, row.get(parent_field)), {})
+        detail = row.get(row_field)
+        identity = (row.get(parent_field), detail)
+        matches = [line for line in parent.get('items', []) if line.get('name') == detail]
+        if (parent.get('docstatus') != 1 or parent.get('is_return') or invoice.get('update_stock')
+                or not row.get('name') or not detail or identity in used or len(matches) != 1
+                or any(not invoice.get(k) or invoice[k] != parent.get(k)
+                       for k in ('company', party.lower(), 'currency'))
+                or any(row.get(k) is None or row[k] != matches[0].get(k)
+                       for k in ('item_code', 'uom', 'qty', 'rate'))):
+            return []
+        used.add(identity)
+        result.append((row['name'], entity, parent['name'], detail))
+    return result
+
+
+def sales_orders(doc):
+    field = 'against_sales_order' if doc.get('doctype') == 'Delivery Note' else 'sales_order'
+    return {item[field] for item in doc.get('items') or [] if item.get(field)}
+
+
+def sales_allocations(doc):
+    return [(index, ref) for index, ref in enumerate(doc.get('references') or [])
+            if ref.get('reference_doctype') == 'Sales Invoice' and ref.get('reference_name')]
+
+
+def sales_facts(documents, *, system="erp"):
+    """Project one observable ERP snapshot using typed order and line references.
+
+    Scope each call to one instance. Day order comes from native business
+    dates. Use a snapshot retained at the desired cutoff for historical grading.
+    """
+    orders = documents.get('Sales Order', {})
+    deliveries = documents.get('Delivery Note', {})
+    invoices = documents.get('Sales Invoice', {})
+
+    def fact(kind, native_id, doc, **fields):
+        return dict(kind=kind, system=system, native_id=native_id,
+                    at=date.fromisoformat(doc['posting_date']).toordinal(), **fields)
+
+    def line_id(delivery, line):
+        return json.dumps([delivery, line], separators=(',', ':'))
+
+    for name, invoice in invoices.items():
+        if invoice.get('docstatus') != 1 or invoice.get('is_return'):
+            continue
+        items = invoice.get('items') or []
+        cases = sorted(sales_orders(invoice).intersection(orders))
+        for order_id in cases:
+            order = orders[order_id]
+            case = order_id if system == 'erp' else f'{system}/{order_id}'
+            if (order.get('docstatus') != 1 or not invoice.get('company') or not invoice.get('customer')
+                    or order.get('company') != invoice['company']
+                    or order.get('customer') != invoice['customer']):
+                continue
+            links = []
+            order_lines = {line['name']: line for line in order.get('items', [])}
+            for item in items:
+                if item.get('sales_order') != order_id:
+                    continue
+                delivery_name, row_name = item.get('delivery_note'), item.get('dn_detail')
+                delivery = deliveries.get(delivery_name, {})
+                actual = next((r for r in delivery.get('items', []) if r['name'] == row_name), {})
+                agreed = order_lines.get(item.get('so_detail'), {})
+                if (delivery.get('docstatus') != 1 or delivery.get('is_return')
+                        or delivery.get('posting_date', '') > invoice['posting_date']
+                        or any(delivery.get(k) != invoice.get(k) for k in ('company', 'customer', 'currency'))
+                        or actual.get('against_sales_order') != order_id or not agreed
+                        or actual.get('so_detail') != item.get('so_detail')
+                        or any(not item.get(k) or item[k] != actual.get(k) or item[k] != agreed.get(k)
+                               for k in ('item_code', 'stock_uom'))
+                        or item.get('stock_qty') != actual.get('stock_qty')):
+                    links.append(None)
+                    continue
+                key = line_id(delivery_name, row_name)
+                links.append(key)
+                yield fact('shipment', key, delivery, case=case, quantity=actual.get('stock_qty'),
+                           uom=actual['stock_uom'])
+
+            # A document total or payment allocation spanning several orders
+            # cannot be apportioned to one order from the header alone.
+            whole = all(item.get('sales_order') == order_id for item in items)
+            currency = invoice.get('currency')
+            key = name if whole else line_id(name, case)
+            amount = invoice.get('rounded_total') if not invoice.get('disable_rounded_total') else None
+            if amount is None:
+                amount = invoice.get('grand_total')
+            yield fact('invoice', key, invoice, case=case, currency=currency,
+                       amount=amount if whole and currency else None, shipment_id=links)
+
+    for name, payment in documents.get('Payment Entry', {}).items():
+        if payment.get('docstatus') != 1 or payment.get('payment_type') != 'Receive':
+            continue
+        for index, ref in sales_allocations(payment):
+            invoice_id = ref['reference_name']
+            invoice = invoices.get(invoice_id)
+            if invoice is None:
+                continue
+            currency = payment.get('paid_from_account_currency')
+            verified = (payment.get('party_type') == 'Customer'
+                        and payment.get('party') and payment['party'] == invoice.get('customer')
+                        and payment.get('company') and payment['company'] == invoice.get('company')
+                        and currency and currency == (invoice.get('party_account_currency')
+                                                      or invoice.get('currency'))
+                        and ref.get('exchange_rate', 1) == 1)
+            yield fact('payment', line_id(name, ref.get('name') or index), payment, invoice_id=invoice_id,
+                       currency=currency, amount=ref.get('allocated_amount') if verified else None)
+
+
 def build(run, cutoff):
     state, config, trace = load(run)
     if cutoff > state['day']:
         raise ValueError('Cutoff exceeds saved run day')
     docs = {}
     for index, row in enumerate(trace, 1):
-        if row.get('kind') == 'readback' and row['day'] <= cutoff:
+        if row.get('kind') in ('readback', 'bank_clearance_readback') and row['day'] <= cutoff:
             doc = row['doc']
-            docs[(doc['doctype'], doc['name'])] = (index, row)
+            identity = doc['doctype'], doc['name']
+            if row['kind'] == 'bank_clearance_readback' and identity in docs:
+                row = {**row, 'doc': {**docs[identity][1]['doc'], **doc}}
+            docs[identity] = (index, row)
     questions=[]
     def candidates(dt):
         return sorted((v for (kind,_),v in docs.items() if kind==dt),key=lambda v:(v[1]['day'],v[1]['doc']['name']))
@@ -71,7 +211,20 @@ def build(run, cutoff):
                         if isinstance(value,dict):return any(refs(v) for v in value.values())
                         if isinstance(value,list):return any(refs(v) for v in value)
                         return isinstance(value,str) and value in ids
-                    if row not in linked and refs(doc):linked.append(row);ids.add(doc['name'])
+                    if dt == 'Sales Order':
+                        order_id = selected[1]['doc']['name']
+                        if kind == 'Payment Entry':
+                            bills = {entry[1]['doc']['name'] for entry in linked
+                                     if entry[1]['doc']['doctype'] == 'Sales Invoice'}
+                            matches = any(ref['reference_name'] in bills
+                                          for _, ref in sales_allocations(doc))
+                        else:
+                            matches = order_id in sales_orders(doc)
+                    else:
+                        matches = refs(doc)
+                    if row not in linked and matches:
+                        linked.append(row)
+                        ids.add(doc['name'])
         add(domain,'medium',prompt+' Start with '+selected[1]['doc']['name']+'.',
             {'recorded_sequence':[{'doctype':r[1]['doc']['doctype'],'native_id':r[1]['doc']['name'],'business_date':r[1]['doc'].get('posting_date',r[1]['doc'].get('transaction_date',r[1]['doc'].get('planned_start_date'))),'observed_day':r[1]['day'],'status':r[1]['doc'].get('status')} for r in sorted(linked,key=lambda r:r[1]['doc'].get('posting_date',r[1]['doc'].get('transaction_date',r[1]['doc'].get('creation',''))))],
              'not_established':'Unlinked or absent steps and physical receipt beyond the available records.'},linked)
@@ -93,8 +246,24 @@ def build(run, cutoff):
             {'answer':'Insufficient evidence: the realized trajectory contains competing inventory, capacity, maintenance and approval constraints; no controlled counterfactual is observed.',
              'required_evidence':'Dated order, material, approval, receipt, capacity and service evidence can support contributing mechanisms, not a uniquely identified causal effect.'},[production[len(production)//2]],'insufficient')
     if candidates('Payment Entry'):
-        add('financial-assurance','hard','Do the posted payments establish that an independent bank cleared every transfer by the cutoff?',
-            {'answer':'No. ERP payment postings establish recorded accounting allocations. No independent bank statement or clearance feed is supplied.'},[candidates('Payment Entry')[-1]],'insufficient')
+        payment = candidates('Payment Entry')[-1]
+        voucher = payment[1]['doc']
+        incoming = voucher.get('payment_type') == 'Receive'
+        amount = voucher.get('received_amount' if incoming else 'paid_amount')
+        currency = voucher.get('paid_to_account_currency' if incoming else 'paid_from_account_currency')
+        matches = [row for row in candidates('Bank Transaction')
+                   if matches_bank_clearance(voucher, row[1]['doc'])]
+        question = f"What bank-statement evidence supports clearance of Payment Entry {voucher['name']} by the cutoff?"
+        if len(matches) == 1:
+            statement = matches[0][1]['doc']
+            add('financial-assurance','hard',question,
+                {'bank_transaction':statement['name'], 'cleared_on':statement['date'],
+                 'allocated_amount':amount, 'currency':currency},
+                [payment, matches[0]])
+        else:
+            add('financial-assurance','hard',question,
+                {'answer':'The observed records do not establish one reconciled bank statement for this payment at the cutoff.'},
+                [payment, *matches], 'insufficient')
     ticket_rows=[r for r in trace if r.get('kind')=='ticket_readback' and r['day']<=cutoff]
     mail_rows=[r for r in trace if r.get('kind')=='native_mail_readback' and r['day']<=cutoff]
     if ticket_rows:

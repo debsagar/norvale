@@ -1,0 +1,26 @@
+services:
+  db:
+    image: mariadb:10.6
+    pull_policy: never
+    environment:
+      MARIADB_ROOT_PASSWORD: ${QMS_DB_PASSWORD:?}
+    command: [--character-set-server=utf8mb4, --collation-server=utf8mb4_unicode_ci]
+    healthcheck:
+      test: [CMD, healthcheck.sh, --connect, --innodb_initialized]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+    volumes: [database:/var/lib/mysql]
+  redis:
+    image: redis:7-alpine
+    pull_policy: never
+  qms:
+    image: ${QMS_IMAGE:-frappe/erpnext:v15.124.1}
+    pull_policy: never
+    working_dir: /home/frappe/frappe-bench
+    command: [bench, serve, --noreload, --nothreading, --port, "8000"]
+    ports: ["127.0.0.1:${QMS_PORT:-}:8000"]
+    volumes: [sites:/home/frappe/frappe-bench/sites]
+volumes:
+  database:
+  sites:
