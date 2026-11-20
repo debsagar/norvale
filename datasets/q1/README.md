@@ -1,5 +1,7 @@
 # Norvale consumer care · January–March 2027
 
+Download [the dataset ZIP](norvale-2027-q1.zip), extract it, and open `norvale.sqlite`. From the repository root, `sha256sum -c datasets/q1/SHA256SUMS` verifies the packaged release. The evaluator key is generated separately when the owner rebuilds the package.
+
 This retrospective slice contains 7,740 records across 90 business-calendar dates from a frozen 120-day synthetic company run. It includes native ERPNext documents and ledger movements, delivered email, and Gitea maintenance reports. The source commit is 0e2d52c. The separate 132-record reference snapshot describes the released catalog, BOMs, synthetic employees and users.
 
 Open `norvale.sqlite` or read the two UTF-8 JSONL files. In SQLite, try:
