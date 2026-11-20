@@ -8,6 +8,8 @@ import shutil
 import subprocess
 import sys
 
+from scripts.check_engine_pin import verify
+
 ROOT = Path(__file__).resolve().parent
 
 
@@ -61,6 +63,11 @@ def main():
                 if a.services == "status":
                     print(json.dumps(rows, indent=2))
             return
+        # On resume the run owns its archived release, even after a checkout upgrade.
+        source = runtime / "release" if (runtime / "commissioned").exists() else ROOT
+        lockfile = source / "engine.lock.json"
+        if lockfile.exists() or source == ROOT:
+            verify(source, json.loads(lockfile.read_text()))
         cfg = load_scenario(a.scenario)
         if a.plan:
             print(json.dumps(dict(scenario=cfg, run=str(runtime), mode="live", archive=str(runtime / "lake")), indent=2))
