@@ -38,10 +38,14 @@ def provision(run=ACTIVE_RUN):
         c=original(*a, **kw)
         c['services']['db']['command'].append('--innodb-fatal-semaphore-wait-threshold=4294967295')
         return c
-    compose_mod.build=build
     ids=[{'id':r['role_id'], 'mail':r['email'].replace('.example','.test'), 'chat':r['role_id'].lower()} for r in ROLES]
+    from native.supplier_amendments import sender_identities
+    config_path = Path(run) / 'config.json'
+    config = json.loads(config_path.read_text()) if config_path.exists() else {}
+    supplier_mail = sender_identities(config.get('supplier_amendment_senders', {}))
     port = int(os.environ["NORVALE_ERP_PORT"]) if os.environ.get("NORVALE_ERP_PORT") else None
-    try:stack.up(ids, datetime(2027,1,1,tzinfo=timezone.utc), frontend_port=port)
+    compose_mod.build=build
+    try:stack.up(ids, datetime(2027,1,1,tzinfo=timezone.utc), frontend_port=port, mail_identities=supplier_mail)
     finally:compose_mod.build=original
     return stack
 
@@ -283,19 +287,23 @@ class Engine:
             if not self.admin.list('Workflow Action Master',{'name':name}):self.admin.create('Workflow Action Master',{'workflow_action_name':name})
         self.write('po-workflow','Workflow',{'workflow_name':'Norvale purchasing approval','document_type':'Purchase Order','is_active':1,'workflow_state_field':'workflow_state','states':[{'state':'Pending Approval','doc_status':'0','allow_edit':'Purchase User'},{'state':'Approved','doc_status':'1','allow_edit':'Purchase Manager'},{'state':'Rejected','doc_status':'0','allow_edit':'Purchase Manager'}],'transitions':[{'state':'Pending Approval','action':'Approve','next_state':'Approved','allowed':'Purchase Manager','allow_self_approval':0},{'state':'Pending Approval','action':'Reject','next_state':'Rejected','allowed':'Purchase Manager','allow_self_approval':0}]})
 
-    def mail(self,key,sender,recipient,subject,body):
-        from native.company_erp import MailReadbackError
+    def mail_client(self, role):
         from norvale.agents.comms import Comms
-        roster={r['role_id']:r for r in ROLES};sec=json.loads((self.run/'env/secrets.json').read_text())
-        def client(role):
-            role={'BUYER':'BUYER_CHEM','SCM_MGR':'SC_MGR','WAREHOUSE':'WH_CLERK','MAINTENANCE':'MAINT_LEAD'}.get(role,role)
-            r=roster[role];return Comms({'mail':r['email'].replace('.example','.test'),'chat':role.lower()},sec[role],self.eps)
+        roster = {r['role_id']: r for r in ROLES}
+        secrets = json.loads((self.run/'env/secrets.json').read_text())
+        role = {'BUYER': 'BUYER_CHEM', 'SCM_MGR': 'SC_MGR', 'WAREHOUSE': 'WH_CLERK',
+                'MAINTENANCE': 'MAINT_LEAD'}.get(role, role)
+        return Comms({'mail': roster[role]['email'].replace('.example', '.test'),
+                      'chat': role.lower()}, secrets[role], self.eps)
+
+    def mail(self,key,sender,recipient,subject,body,*,sent_at=None):
+        from native.company_erp import MailReadbackError
         reference = hashlib.sha256(key.encode()).hexdigest()
         marker = f'[Ref {reference[:16]}] '
-        origin, receiver = client(sender), client(recipient)
+        origin, receiver = self.mail_client(sender), self.mail_client(recipient)
         message_id = f'<norvale-{reference}@{origin.addr.split("@")[1]}>'
         ledger = self.state.setdefault('mail_operations', {})
-        sent_day = ledger.get(key, {}).get('sent_day', self.date())
+        sent_day = ledger.get(key, {}).get('sent_day', sent_at.isoformat() if sent_at else self.date())
         sent_at = datetime.fromisoformat(sent_day).replace(tzinfo=timezone.utc)
         expected = EmailMessage()
         expected.set_content(body)
@@ -570,6 +578,10 @@ class Engine:
             previous=d['input'].get('evidence',{});previous=previous.get('observations',previous)
             return evidence.get('supplier') is not None and previous.get('supplier')==evidence['supplier']
         cases=[{'as_of':d['input']['as_of'],'mode':d['mode'],'output':{'action':d['output']['action'],'reason':d['output'].get('reason','')[:240]}} for d in history if relevant(d)][-6:]
+        if evidence.get('supplier_amendments'):
+            # An existing PO price limit does not resolve a supplier's changed terms.
+            return self.decision(key, role, {'observations': evidence, 'prior_cases': cases,
+                                            'effective_policies': policies}, question)['output']
         matches=[p for p in policies if role=='SCM_MGR' and type(evidence.get('grand_total')) in (int,float) and 0<=evidence['grand_total']<=p['approval_limit'] and evidence.get('supplier') in p['suppliers'] and evidence.get('items') and all(r.get('item_code') in p['items'] and r.get('qty',0)>0 and r.get('rate',-1)>=0 for r in evidence['items'])]
         policy=matches[-1] if matches else None
         def comparable_evidence(value):
@@ -915,6 +927,8 @@ class Engine:
             return result
 
     def approvals(self):
+        from native.supplier_amendments import read_buyer_inbox, refer_to_approver
+        inbox = None
         ops=self.state['ops']
         purchase_docs={key:self.get(key,'SCM_MGR') for key,p in ops['purchases'].items() if not p.get('received')}
         for key,p in list(ops['purchases'].items()):
@@ -933,8 +947,17 @@ class Engine:
             coverage=self.observe('SCM_MGR','Bin',{'item_code':['in',[r['item_code'] for r in po['items']]]},['item_code','warehouse','actual_qty'])
             evidence={k:po.get(k) for k in ['name','supplier','grand_total']}
             evidence['items']=[{k:r.get(k) for k in ['item_code','item_name','qty','uom','rate','amount','schedule_date']} for r in po['items']]
-            quote=self.get(p.get('latest_quote','quote:'+key),'SCM_MGR')
-            if quote.get('valid_till') and quote['valid_till']<self.date():
+            if p.get('vendor') in self.config.get('supplier_amendment_senders', {}):
+                cutoff = self.recurring_phase_time(self.day)
+                if inbox is None:
+                    inbox = read_buyer_inbox(self, cutoff)
+                amendments = refer_to_approver(self, key, p, po, inbox, cutoff)
+                if amendments:
+                    evidence['supplier_amendments'] = amendments
+            original_quote_key = 'quote:' + key
+            quote_key = original_quote_key if evidence.get('supplier_amendments') else p.get('latest_quote', original_quote_key)
+            quote = self.get(quote_key, 'SCM_MGR')
+            if not evidence.get('supplier_amendments') and quote.get('valid_till') and quote['valid_till']<self.date():
                 latest_quote='requote:'+key+':'+str(self.day)
                 quote=self.write(latest_quote,'Supplier Quotation',{'company':self.company,'supplier':po['supplier'],'transaction_date':self.date(),'valid_till':self.dated(self.day+7),'items':p['items']},'BUYER',True)
                 p['latest_quote']=latest_quote;self.persist()
@@ -948,7 +971,13 @@ class Engine:
                 from native.company_world import evidence as world_evidence
                 evidence['carrier_observations'] = world_evidence(self, 'SCM_MGR')
             decision_key = 'po-review:'+key+':'+str(self.day)
-            result=self.purchase_decision(decision_key,'SCM_MGR',evidence,'Decide this PO on its own current evidence: approve, defer, reject or investigate. Separately and optionally propose a scoped standing_policy effective tomorrow and reviewed in 14 days. Not having grounds for a policy is not a reason to defer this PO. The approval_limit applies per future PO; other_open_orders show observed supplier totals. Assess current observations rather than copying earlier reasons. Quarantine is the established receiving/inspection path, not a location conflict.',model=first)
+            question = 'Decide this PO on its own current evidence: approve, defer, reject or investigate. Separately and optionally propose a scoped standing_policy effective tomorrow and reviewed in 14 days. Not having grounds for a policy is not a reason to defer this PO. The approval_limit applies per future PO; other_open_orders show observed supplier totals. Assess current observations rather than copying earlier reasons. Quarantine is the established receiving/inspection path, not a location conflict.'
+            if evidence.get('supplier_amendments'):
+                version = json.dumps(evidence['supplier_amendments'], sort_keys=True).encode()
+                decision_key += ':' + hashlib.sha256(version).hexdigest()
+                question += (' Compare the effective supplier amendments with the persisted draft and original quotation. '
+                             'Buyer referrals are not approvals. A workflow approval submits the draft as written.')
+            result = self.purchase_decision(decision_key, 'SCM_MGR', evidence, question, model=first)
             if result['action'] in ('approve','reject'):
                 action='Approve' if result['action']=='approve' else 'Reject'
                 self.api['SCM_MGR'].call('frappe.model.workflow.apply_workflow', {'doc':json.dumps(po), 'action':action})
@@ -1338,7 +1367,9 @@ class Engine:
     @staticmethod
     def validate_config(c):
         from engine.world import validate
+        from native.supplier_amendments import sender_identities
         validate(c)
+        sender_identities(c.get('supplier_amendment_senders', {}))
         if not 1<=c['days']<=365:raise ValueError('days must be 1..365')
         if not 1<=c['orders_per_day']<=18:raise ValueError('orders_per_day must be 1..18')
         if not 0<c['demand_scale']<=1:raise ValueError('demand_scale must be in (0,1]')
@@ -1442,14 +1473,19 @@ class Engine:
                 reconcile(self, self.run/'env/planning-report.json')
         return None
 
+    def recurring_phase_time(self, day):
+        from native.recurring_extensions import COMPANY_OPEN, MIDNIGHT
+        return MIDNIGHT + timedelta(days=day, minutes=COMPANY_OPEN if 'company_timing' in (self.config or {}) else 720)
+
     def run_phase(self, day, key, action):
-        from native.recurring_extensions import COMPANY_OPEN, DAY, MIDNIGHT
-        minute = day * DAY + (COMPANY_OPEN if 'company_timing' in (self.config or {}) else 720)
+        from native.recurring_extensions import DAY, MIDNIGHT
+        target = self.recurring_phase_time(day)
+        minute = (target - MIDNIGHT) // timedelta(minutes=1)
         if self.config and key.startswith(f'd{day:04}:'):
             self.run_additions(minute)
             # Queued native work can checkpoint a different day and event ID.
             self.day, self.event = day, key
-        self.advance_clock(MIDNIGHT + timedelta(minutes=minute))
+        self.advance_clock(target)
         if self.config and self.config.get('company_operating') and key.endswith(':management'):
             from integrations.company_run.lake import scheduled_scan
             scheduled_scan(self, minute)

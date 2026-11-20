@@ -73,3 +73,13 @@ Every contribution should state: **affected A–L blocks → input evidence → 
 ## Proposed company behavior and integrations
 
 [Company logic architecture](COMPANY-LOGIC.md) grounds the proposed MES, QMS, PLM and lakehouse integration in manufacturing workflows, record ownership, guards and failure recovery. It extends this A–L contract; it is not a claim of implemented integrations.
+
+## Dated supplier price changes
+
+D and E bind a buyer-visible message to the submitted quotation and the exact
+draft PO row as of the next eligible approval cutoff. J and K retain the
+supplier message and the buyer's confirmed referral in their native mailboxes.
+H receives the effective terms and original draft prices. I still requires the
+SCM workflow identity for a PO action. The regular ERP projection alone lacks
+mail, so extracting a supplier amendment requires the related mailbox records.
+[Configure and test supplier amendment intake](GENERATING.md#refer-a-supplier-price-amendment-to-scm)

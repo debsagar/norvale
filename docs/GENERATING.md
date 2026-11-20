@@ -335,3 +335,61 @@ python3 -m venv .venv
 ```
 
 Open notebooks from `notebooks/`; their data path is `../data/observable`. Run All only reads files. To inspect a new run, pass `--run runs/my-run/export`; the generated notebook uses a relative path to that export's `observable/` directory. `native/build_evidence.py` separately builds development reference questions from private trace/state of a new run; private traces are not included in this release.
+
+## Refer a supplier price amendment to SCM
+
+Supply `supplier_amendment_senders` in the config passed to
+`native.company.initialize` for a fresh recurring run. For example:
+
+```python
+from pathlib import Path
+from native.company import DEFAULT_CONFIG, initialize
+
+initialize(Path("runs/quote-amendment"), {
+    **DEFAULT_CONFIG,
+    "supplier_amendment_senders": {"BRENNER": "brenner-quotes@norvale.test"},
+})
+```
+
+This provisions a mail-only supplier identity on the existing isolated mail
+server. Submit through the authenticated local supplier mailbox, using the
+commissioned `SUPPLIER_BRENNER` identity. The feature relies on the private
+stack's sender-login enforcement and the delivery service's Return-Path and IMAP
+INTERNALDATE. It does not accept external internet sender domains. Keep the
+mailboxes with the run when reopening it.
+
+Send a directly addressed plain-text message to the chemical buyer
+`priya.nair@norvale.test` with subject `Supplier quotation amendment`, a unique
+Message-ID, and a JSON body containing the exact native names and units:
+
+```json
+{
+  "supplier": "Brenner Tensid AG",
+  "quote": "PUR-SQTN-2027-00001",
+  "quote_line": "<quotation child-row name>",
+  "po": "PUR-ORD-2027-00001",
+  "po_line": "<draft PO child-row name>",
+  "currency": "EUR",
+  "uom": "Kg",
+  "unit_price": "1.85",
+  "effective_at": "2027-01-02T07:00:00+00:00"
+}
+```
+
+Only price amendments after drafting are supported. At the normal approval
+cutoff, the buyer reads messages delivered by that time whose terms are already
+effective, verifies the native supplier and exact PO-to-quotation join, and
+sends a read-back-confirmed referral to SCM. The referral preserves both native
+row IDs and the supplier Message-ID. Review evidence includes original draft
+and quote prices, with the latest effective terms marked for each line. Equal
+effective timestamps with different messages remain visible for review.
+An existing standing price policy cannot close the amendment automatically.
+The ordinary SCM decision and ERP workflow still govern the draft. An approval
+submits its existing terms. Buyer referral never changes the draft or accepts
+the amendment for the supplier. A future effective date or a later mailbox
+arrival can enter review at the next eligible cutoff while the PO is still draft.
+
+Offline transport coverage is in `tests/test_supplier_amendments_offline.py`.
+It exercises the normal replenishment and approval phases, with simulated
+mail, ERP and judgment-provider responses. Native service commissioning is
+outside that test.

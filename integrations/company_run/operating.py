@@ -699,7 +699,8 @@ def offline_decision(engine, key, role, evidence, question):
         quote = evidence['supplier_quote']
         def lines(record):
             return sorted((row['item_code'], row['qty'], row['rate'], row['amount']) for row in record['items'])
-        approved = (evidence['supplier'] == quote['supplier'] and quote['valid_till'] >= engine.date()
+        approved = (not evidence.get('supplier_amendments')
+                    and evidence['supplier'] == quote['supplier'] and quote['valid_till'] >= engine.date()
                     and evidence['grand_total'] == quote['grand_total'] > 0
                     and lines(evidence) == lines(quote) and bool(lines(quote))
                     and all(qty > 0 and rate > 0 for _, qty, rate, _ in lines(quote)))
