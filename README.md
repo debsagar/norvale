@@ -101,3 +101,5 @@ python3 generate.py --help
 The completed run recorded nine passing checks, including native links/labor, material and shipment conservation, payment allocations, role permissions, resume behavior, and ledger balance. Those results are saved evidence; the offline checks above do not rerun live-service verification.
 
 This is a generation prototype, not a completed extraction benchmark. Regimes and labor are modeled; QA readings are nominal; payroll is aggregate. Production may run on weekends. Through February 3, policy-unmatched cases incorrectly bypassed JEV; this was corrected February 4 without rewriting history. JEV covers selected role decisions, not every operational API. The run recorded 70 JEV calls and 105 model decisions, with no standing-policy executions. See [limitations and provenance](docs/PROVENANCE.md).
+
+Optional agent interview exercise: [Expert inbox and evidence-based grading](docs/EXPERT-INBOX.md).

@@ -63,10 +63,15 @@ class Comms:
             raise imaplib.IMAP4.error(f"Mail readback failed ({status})")
         return data
 
-    def inbox(self, only_unseen=False, limit=15):
+    def inbox(self, only_unseen=False, limit=15, *, subject=None):
         with self._imap() as box:
             self._checked_imap(box.select("INBOX", readonly=True))
-            ids = self._checked_imap(box.uid("search", None, "UNSEEN" if only_unseen else "ALL"))
+            criteria = ["UNSEEN" if only_unseen else "ALL"]
+            if subject is not None:
+                if any(ord(c) < 32 or ord(c) > 126 for c in subject):
+                    raise ValueError("Invalid subject search")
+                criteria.extend(["HEADER", "Subject", box._quote(subject)])
+            ids = self._checked_imap(box.uid("search", None, *criteria))
             out = []
             for uid in ids[0].split()[-limit:]:
                 data = self._checked_imap(box.uid(
@@ -75,6 +80,9 @@ class Comms:
                 out.append({"uid": uid.decode(), "from": str(hdr["From"]), "to": str(hdr["To"]), "subject": str(hdr["Subject"]),
                             "date": str(hdr["Date"]), "seen": b"\\Seen" in data[0][0], "message_id": str(hdr["Message-ID"])})
             return out
+
+    def find_subject(self, subject):
+        return self.inbox(limit=0, subject=subject)
 
     def read_mail(self, uid, *, body_limit=4000):
         with self._imap() as box:

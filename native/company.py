@@ -1276,6 +1276,9 @@ class Engine:
             ops['maintenance'][key]={'day':self.day,'due':self.day+self.config['maintenance_days'],'meter':ops['meter'],'ticket':ticket['number'],'issue_body':issue_body};self.persist()
 
     def management(self):
+        if (self.run/'private/expert-inbox-v1').is_dir():
+            from norvale.agents.expert_inbox import answer_pending
+            answer_pending(self.run)
         due = (self.day + 1) % self.config['report_every'] == 0
         binding = self.run/'env/planning-report.json'
         if binding.is_file():

@@ -13,3 +13,5 @@ env-cache/
 *.tar
 *.log
 .ipynb_checkpoints/
+
+**/private/expert-inbox-v1/
