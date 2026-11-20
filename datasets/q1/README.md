@@ -1,6 +1,8 @@
-# Norvale consumer care · January–March 2027
+# ERPNext + email + Gitea — frozen 2027 Q1 dataset
 
-Download [the dataset ZIP](norvale-2027-q1.zip), extract it, and open `norvale.sqlite`. From the repository root, `sha256sum -c datasets/q1/SHA256SUMS` verifies the packaged release. The evaluator key is generated separately when the owner rebuilds the package.
+This archive is frozen for historical research. New quarterly runs use the full company deployment with separate ERP, MES, PLM and QMS sources and Delta Lake. This legacy builder is retained solely to verify the archived release.
+
+Download [the dataset ZIP](erpnext-email-gitea-2027-q1.zip), extract it, and open `norvale.sqlite`. From the repository root, `sha256sum -c datasets/q1/SHA256SUMS` verifies the packaged release. The evaluator key is generated separately when the owner rebuilds the package.
 
 This retrospective slice contains 7,740 records across 90 business-calendar dates from a frozen 120-day synthetic company run. It includes native ERPNext documents and ledger movements, delivered email, and Gitea maintenance reports. The source commit is 0e2d52c. The separate 132-record reference snapshot describes the released catalog, BOMs, synthetic employees and users.
 
