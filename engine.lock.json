@@ -1,0 +1,13 @@
+{
+  "repository": "https://github.com/debsagar/enterpriseengine",
+  "version": "0.2.0",
+  "commit": "285eb0423cee85845ec667db2702e0b192a5ec56",
+  "files": {
+    "__init__.py": "d19509b6a78a920fbcad8045e49df4468fa292ab033980b97814fd2a1687ee52",
+    "__main__.py": "c51b553be011665f17e74718c67970db0a6bc15a49d3c830047782b8d3ea11b7",
+    "_extension.py": "3220d765c7985d17c30f3fd40b864a76ae65f04d30f1cb38c6b796fac0b4d242",
+    "_journal.py": "9be6e8fc03a82ce5e09589f49bc98b113c4d363100ae8f334d8efcac0633f9c3",
+    "adapter_specs.json": "bd6fb7d6f672dc786f44f062cc862d9841b058cb2e65bcba70efdecba5407afe",
+    "world.py": "87847b62ca41c1015d59b7531f428928fd1e1394b6641fbf3c8c8ae557fc1752"
+  }
+}

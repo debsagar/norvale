@@ -1,5 +1,6 @@
 # Norvale — Phase 1 data generation v2
 
+[Engine version, upgrade order and restore points](docs/VERSIONS.md)
 Norvale is a synthetic consumer-care manufacturer whose people perform modeled business work in real software: ERPNext, Gitea Issues, and SMTP/IMAP email. This repository contains the v2 generator and the filtered records from its completed 120-day run, January 1–April 30, 2027.
 
 **Helping with development?** Read [the collaborator handoff](HANDOFF.md) and [the operating-loop diagram and code map](docs/ARCHITECTURE.md). Claude and Codex share [AGENTS.md](AGENTS.md).
